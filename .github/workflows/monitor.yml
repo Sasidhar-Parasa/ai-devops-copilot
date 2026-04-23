@@ -1,0 +1,203 @@
+# ═══════════════════════════════════════════════════════════════════
+#  Nightly Health Monitor
+#  Runs daily at 06:00 UTC — checks deployed services are healthy
+#  Creates a GitHub Issue if services are down
+# ═══════════════════════════════════════════════════════════════════
+
+name: Nightly Health Monitor
+
+on:
+  schedule:
+    - cron: '0 6 * * *'    # 06:00 UTC daily
+  workflow_dispatch:         # Allow manual trigger
+
+jobs:
+  health-check:
+    name: 🏥 Service Health Check
+    runs-on: ubuntu-latest
+
+    permissions:
+      issues: write   # Needed to create GitHub issues on failure
+
+    env:
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ secrets.GCP_REGION }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Get service URLs
+        id: urls
+        run: |
+          BACKEND_URL=$(gcloud run services describe ai-copilot-backend \
+            --region=${{ env.GCP_REGION }} \
+            --format="value(status.url)" 2>/dev/null || echo "")
+          FRONTEND_URL=$(gcloud run services describe ai-copilot-frontend \
+            --region=${{ env.GCP_REGION }} \
+            --format="value(status.url)" 2>/dev/null || echo "")
+          echo "backend=$BACKEND_URL" >> $GITHUB_OUTPUT
+          echo "frontend=$FRONTEND_URL" >> $GITHUB_OUTPUT
+          echo "Backend URL: $BACKEND_URL"
+          echo "Frontend URL: $FRONTEND_URL"
+
+      - name: Check backend health
+        id: backend-health
+        run: |
+          URL="${{ steps.urls.outputs.backend }}"
+          if [ -z "$URL" ]; then
+            echo "status=missing" >> $GITHUB_OUTPUT
+            echo "❌ Backend service not found"
+            exit 0
+          fi
+
+          STATUS=$(curl -s -o /tmp/backend-resp.json \
+            -w "%{http_code}" \
+            --max-time 15 \
+            "$URL/api/ping" || echo "000")
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "Backend HTTP status: $STATUS"
+
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ Backend healthy"
+            cat /tmp/backend-resp.json | python3 -m json.tool
+          else
+            echo "❌ Backend unhealthy (status=$STATUS)"
+          fi
+
+      - name: Check chat endpoint
+        id: chat-health
+        run: |
+          URL="${{ steps.urls.outputs.backend }}"
+          if [ -z "$URL" ]; then
+            echo "status=skip" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          STATUS=$(curl -s -o /tmp/chat-resp.json \
+            -w "%{http_code}" \
+            --max-time 30 \
+            -X POST "$URL/api/chat" \
+            -H "Content-Type: application/json" \
+            -d '{"message":"system health check","session_id":"monitor"}' \
+            || echo "000")
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          if [ "$STATUS" = "200" ]; then
+            INTENT=$(cat /tmp/chat-resp.json | python3 -c "import json,sys; print(json.load(sys.stdin).get('intent','?'))")
+            echo "✅ Chat endpoint healthy (intent=$INTENT)"
+          else
+            echo "❌ Chat endpoint unhealthy (status=$STATUS)"
+          fi
+
+      - name: Check frontend
+        id: frontend-health
+        run: |
+          URL="${{ steps.urls.outputs.frontend }}"
+          if [ -z "$URL" ]; then
+            echo "status=missing" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$URL" || echo "000")
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ Frontend healthy"
+          else
+            echo "❌ Frontend unhealthy (status=$STATUS)"
+          fi
+
+      - name: Generate health report
+        id: report
+        run: |
+          BACKEND_STATUS="${{ steps.backend-health.outputs.status }}"
+          CHAT_STATUS="${{ steps.chat-health.outputs.status }}"
+          FRONTEND_STATUS="${{ steps.frontend-health.outputs.status }}"
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+          
+          ALL_HEALTHY=true
+          [[ "$BACKEND_STATUS"  != "200" ]] && ALL_HEALTHY=false
+          [[ "$CHAT_STATUS"     != "200" ]] && ALL_HEALTHY=false
+          [[ "$FRONTEND_STATUS" != "200" ]] && ALL_HEALTHY=false
+
+          echo "all_healthy=$ALL_HEALTHY" >> $GITHUB_OUTPUT
+          echo "timestamp=$TIMESTAMP"     >> $GITHUB_OUTPUT
+
+          echo "## 🏥 Health Report — $TIMESTAMP" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend /api/ping | $([[ "$BACKEND_STATUS"  == "200" ]] && echo '✅ Healthy' || echo "❌ $BACKEND_STATUS") |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend /api/chat | $([[ "$CHAT_STATUS"     == "200" ]] && echo '✅ Healthy' || echo "❌ $CHAT_STATUS") |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend          | $([[ "$FRONTEND_STATUS" == "200" ]] && echo '✅ Healthy' || echo "❌ $FRONTEND_STATUS") |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Overall: $([[ "$ALL_HEALTHY" == "true" ]] && echo '✅ All systems operational' || echo '❌ Degraded')**" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create GitHub Issue on failure
+        if: steps.report.outputs.all_healthy != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `🚨 Service Degradation Detected — ${new Date().toISOString().split('T')[0]}`;
+            const body = `
+            ## 🚨 Automated Health Monitor Alert
+
+            One or more services failed the nightly health check.
+
+            | Service | Status |
+            |---------|--------|
+            | Backend /api/ping | \`${{ steps.backend-health.outputs.status }}\` |
+            | Backend /api/chat | \`${{ steps.chat-health.outputs.status }}\` |
+            | Frontend | \`${{ steps.frontend-health.outputs.status }}\` |
+
+            **Backend URL:** ${{ steps.urls.outputs.backend }}
+            **Frontend URL:** ${{ steps.urls.outputs.frontend }}
+            **Detected at:** ${{ steps.report.outputs.timestamp }}
+
+            ### Recommended Actions
+            1. Check Cloud Run logs: \`gcloud logging read 'resource.type=cloud_run_revision' --limit=50\`
+            2. Check for recent deployments: GitHub Actions → Deploy tab
+            3. Redeploy: \`git commit --allow-empty -m "fix: force redeploy" && git push\`
+            4. Rollback: \`gcloud run services update-traffic ai-copilot-backend --to-revisions=PREV=100\`
+
+            ---
+            *Created automatically by [Nightly Health Monitor](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*
+            `;
+
+            // Check if a similar issue is already open
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'monitoring,automated'
+            });
+
+            const existingIssue = issues.find(i => i.title.includes('Service Degradation'));
+
+            if (!existingIssue) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['monitoring', 'automated', 'bug']
+              });
+              console.log('Created new issue for service degradation');
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existingIssue.number,
+                body: `Still degraded as of ${{ steps.report.outputs.timestamp }}`
+              });
+              console.log('Added comment to existing issue');
+            }

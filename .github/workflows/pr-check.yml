@@ -1,0 +1,205 @@
+# ═══════════════════════════════════════════════════════════════════
+#  Pull Request Validation Workflow
+#  Runs on every PR — fast feedback before merge
+#  Does NOT deploy anything — safe for contributor PRs
+# ═══════════════════════════════════════════════════════════════════
+
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+# Cancel in-progress runs for same PR
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Backend: lint + test ────────────────────────────────────────
+  backend-checks:
+    name: 🧪 Backend Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx ruff
+
+      - name: Lint (Ruff)
+        working-directory: backend
+        run: |
+          ruff check . \
+            --select=E,F,W,I \
+            --ignore=E501,W503 \
+            --output-format=github
+        continue-on-error: true   # Lint warnings don't block PR
+
+      - name: Type check (basic)
+        working-directory: backend
+        run: |
+          python3 -c "
+          import sys, importlib
+          modules = ['main', 'models.schemas', 'services.llm_service',
+                     'services.database', 'agents.coordinator']
+          ok = True
+          for m in modules:
+              try:
+                  importlib.import_module(m)
+                  print(f'  ✅ {m}')
+              except Exception as e:
+                  print(f'  ❌ {m}: {e}')
+                  ok = False
+          sys.exit(0 if ok else 1)
+          "
+        env:
+          PYTHONPATH: "."
+
+      - name: Run tests
+        working-directory: backend
+        env:
+          GROQ_API_KEY: ""
+          GEMINI_API_KEY: ""
+          GCP_PROJECT_ID: "test-project"
+        run: |
+          python -m pytest tests/ -v --tb=short \
+            --junitxml=test-results.xml \
+            -p no:warnings
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr-test-results-${{ github.event.pull_request.number }}
+          path: backend/test-results.xml
+          retention-days: 3
+
+  # ── Frontend: build check ───────────────────────────────────────
+  frontend-build:
+    name: 🎨 Frontend Build Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        env:
+          VITE_API_URL: "https://api.example.com/api"  # Dummy for build check
+        run: npm run build
+
+      - name: Check bundle size
+        working-directory: frontend
+        run: |
+          BUNDLE_SIZE=$(du -sh dist/ | cut -f1)
+          echo "📦 Bundle size: $BUNDLE_SIZE"
+          # Warn if > 5MB
+          BYTES=$(du -sb dist/ | cut -f1)
+          if [ "$BYTES" -gt 5242880 ]; then
+            echo "⚠️ Warning: Bundle size exceeds 5MB"
+          else
+            echo "✅ Bundle size is within limits"
+          fi
+
+  # ── Docker build validation ─────────────────────────────────────
+  docker-validate:
+    name: 🐳 Docker Build Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate backend Dockerfile (build only, no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: false
+          tags: ai-copilot-backend:pr-${{ github.event.pull_request.number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate frontend Dockerfile (build only, no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: false
+          tags: ai-copilot-frontend:pr-${{ github.event.pull_request.number }}
+          build-args: |
+            VITE_API_URL=https://api.example.com/api
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Terraform validate ──────────────────────────────────────────
+  terraform-validate:
+    name: 🏗️ Terraform Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+
+      - name: Terraform Format Check
+        working-directory: infra/terraform
+        run: terraform fmt -check -recursive
+        continue-on-error: true  # Format issues are warnings
+
+      - name: Terraform Init (local backend for validation)
+        working-directory: infra/terraform
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        working-directory: infra/terraform
+        run: terraform validate
+
+  # ── PR Summary ─────────────────────────────────────────────────
+  pr-summary:
+    name: 📋 PR Summary
+    runs-on: ubuntu-latest
+    needs: [backend-checks, frontend-build, docker-validate, terraform-validate]
+    if: always()
+
+    steps:
+      - name: Post PR summary
+        run: |
+          echo "## 🔍 PR Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🧪 Backend Tests | ${{ needs.backend-checks.result == 'success' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🎨 Frontend Build | ${{ needs.frontend-build.result == 'success' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐳 Docker Build | ${{ needs.docker-validate.result == 'success' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🏗️ Terraform | ${{ needs.terraform-validate.result == 'success' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**PR:** #${{ github.event.pull_request.number }} — ${{ github.event.pull_request.title }}" >> $GITHUB_STEP_SUMMARY
