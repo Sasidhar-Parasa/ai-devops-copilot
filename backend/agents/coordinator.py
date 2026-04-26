@@ -9,13 +9,14 @@ from typing import Any, Dict, List
 from models.schemas import AgentStep, AgentType, ChatRequest, ChatResponse, Intent
 from services.llm_service import call_llm, _extract_github_url
 from services.session_manager import (
-    get_session, update_session, clear_deploy_context,
+    get_session, clear_deploy_context,
     get_pending_deploy, set_pending_deploy,
 )
 from agents.monitoring_agent import MonitoringAgent
 from agents.incident_agent import IncidentAgent
 from agents.root_cause_agent import RootCauseAgent
 from agents.fix_agent import FixAgent
+from agents.deployment_agent import DeploymentAgent
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +27,6 @@ try:
 except ImportError:
     REAL_DEPLOY_AVAILABLE = False
     logger.warning("deploy_service not available")
-
-# Import real deployment agent for rollback/simulation
-from agents.deployment_agent import DeploymentAgent
 
 
 class CoordinatorAgent:
@@ -43,7 +41,7 @@ class CoordinatorAgent:
         steps: List[AgentStep] = []
         all_data: Dict[str, Any] = {}
         session_id = request.session_id or "default"
-        session = get_session(session_id)
+        get_session(session_id)  # ensure session exists
 
         # ── Step 1: Understand intent via LLM ────────────────────────────────
         t0 = time.monotonic()

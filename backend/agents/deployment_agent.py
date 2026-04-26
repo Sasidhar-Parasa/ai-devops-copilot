@@ -4,15 +4,15 @@ Deployment Agent – Simulates CI/CD pipeline execution
 import asyncio
 import json
 import logging
+import random
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-from services.database import save_deployment, get_deployments
+from services.database import get_deployments, save_deployment
 
 logger = logging.getLogger(__name__)
 
-# Realistic pipeline log templates
 BUILD_LOGS = [
     "📦 Fetching dependencies from registry...",
     "🔍 Running static analysis (pylint, mypy)...",
@@ -21,7 +21,7 @@ BUILD_LOGS = [
     "   Step 1/8: FROM python:3.11-slim",
     "   Step 4/8: COPY requirements.txt .",
     "   Step 5/8: RUN pip install --no-cache-dir -r requirements.txt",
-    "   Step 8/8: CMD [\"uvicorn\", \"main:app\"]",
+    '   Step 8/8: CMD ["uvicorn", "main:app"]',
     "✅ Image built: {app}:{version} (287MB)",
     "🔐 Pushing to Artifact Registry: gcr.io/project/{app}:{version}",
     "✅ Image pushed successfully",
@@ -67,19 +67,12 @@ ROLLBACK_LOGS = [
 class DeploymentAgent:
     async def run(self, app_name: str, version: str = "latest") -> Dict[str, Any]:
         dep_id = f"dep-{uuid.uuid4().hex[:8]}"
-
-        # Determine if this deployment will fail (30% chance for realism)
-        import random
-        will_fail = random.random() < 0.3
-        fail_at_test = will_fail
-
+        fail_at_test = random.random() < 0.3
         stages = []
 
-        # ── Stage 1: Build ─────────────────────────────────────────────
-        await asyncio.sleep(0.3)  # Simulate build time
-        build_logs = [
-            l.format(app=app_name, version=version) for l in BUILD_LOGS
-        ]
+        # ── Stage 1: Build ──────────────────────────────────────────────────
+        await asyncio.sleep(0.3)
+        build_logs = [line.format(app=app_name, version=version) for line in BUILD_LOGS]
         stages.append({
             "name": "Build",
             "status": "success",
@@ -89,15 +82,15 @@ class DeploymentAgent:
             "completed_at": datetime.utcnow().isoformat(),
         })
 
-        # ── Stage 2: Test ──────────────────────────────────────────────
+        # ── Stage 2: Test ───────────────────────────────────────────────────
         await asyncio.sleep(0.3)
         if fail_at_test:
             test_logs = [
-                l.format(
+                line.format(
                     test_result="FAILED",
                     test_summary="❌ 1 test failed | 246/247 passed",
                 )
-                for l in TEST_LOGS
+                for line in TEST_LOGS
             ]
             test_logs.append("💥 FAIL: assert response.status_code == 200, got 500")
             stages.append({
@@ -117,14 +110,14 @@ class DeploymentAgent:
                 "completed_at": None,
             })
             final_status = "failed"
-            error_msg = f"Integration test failed: TestCheckoutFlow assertion error"
+            error_msg = "Integration test failed: TestCheckoutFlow assertion error"
         else:
             test_logs = [
-                l.format(
+                line.format(
                     test_result="PASSED",
                     test_summary="✅ All 247 tests passed",
                 )
-                for l in TEST_LOGS
+                for line in TEST_LOGS
             ]
             stages.append({
                 "name": "Test",
@@ -135,11 +128,9 @@ class DeploymentAgent:
                 "completed_at": datetime.utcnow().isoformat(),
             })
 
-            # ── Stage 3: Deploy ────────────────────────────────────────
+            # ── Stage 3: Deploy ─────────────────────────────────────────────
             await asyncio.sleep(0.3)
-            deploy_logs = [
-                l.format(app=app_name, version=version) for l in DEPLOY_LOGS
-            ]
+            deploy_logs = [line.format(app=app_name, version=version) for line in DEPLOY_LOGS]
             stages.append({
                 "name": "Deploy",
                 "status": "success",
@@ -151,7 +142,6 @@ class DeploymentAgent:
             final_status = "success"
             error_msg = None
 
-        # Persist to DB
         dep = {
             "id": dep_id,
             "app_name": app_name,
@@ -176,7 +166,6 @@ class DeploymentAgent:
         }
 
     async def rollback(self, app_name: str) -> Dict[str, Any]:
-        # Find previous successful deployment
         history = get_deployments()
         prev_version = "v2.3.8"
         for dep in history:
@@ -186,20 +175,18 @@ class DeploymentAgent:
 
         dep_id = f"dep-{uuid.uuid4().hex[:8]}"
         rollback_logs = [
-            l.format(app=app_name, prev_version=prev_version)
-            for l in ROLLBACK_LOGS
+            line.format(app=app_name, prev_version=prev_version)
+            for line in ROLLBACK_LOGS
         ]
 
-        stages = [
-            {
-                "name": "Rollback",
-                "status": "success",
-                "duration_seconds": 28,
-                "logs": rollback_logs,
-                "started_at": datetime.utcnow().isoformat(),
-                "completed_at": datetime.utcnow().isoformat(),
-            }
-        ]
+        stages = [{
+            "name": "Rollback",
+            "status": "success",
+            "duration_seconds": 28,
+            "logs": rollback_logs,
+            "started_at": datetime.utcnow().isoformat(),
+            "completed_at": datetime.utcnow().isoformat(),
+        }]
 
         dep = {
             "id": dep_id,
