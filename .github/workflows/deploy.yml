@@ -1,8 +1,6 @@
 # ═══════════════════════════════════════════════════════════════════
 #  AI DevOps Copilot — GitHub Actions CI/CD Pipeline
-#
-#  Triggers: push to main, PRs to main
-#  Flow: Lint → Test → Build → Push to Artifact Registry → Deploy to Cloud Run
+#  Triggers on ANY push to main (no path filter)
 # ═══════════════════════════════════════════════════════════════════
 
 name: CI/CD Pipeline
@@ -10,80 +8,58 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [main]
-    paths:
-      - 'backend/**'
-      - 'frontend/**'
-      - '.github/workflows/**'
   pull_request:
     branches: [main]
-    paths:
-      - 'backend/**'
-      - 'frontend/**'
+  workflow_dispatch:   # ← allows manual trigger from GitHub UI
 
-# Cancel in-progress runs on new push to same branch
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  # ── GCP Config ─────────────────────────────────────────────────────
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  GCP_REGION: ${{ secrets.GCP_REGION || 'us-central1' }}
-  ARTIFACT_REGISTRY: ${{ secrets.GCP_REGION || 'us-central1' }}-docker.pkg.dev
-  AR_REPO: copilot
-
-  # ── Image names ────────────────────────────────────────────────────
-  BACKEND_SERVICE: ai-copilot-backend
-  FRONTEND_SERVICE: ai-copilot-frontend
+  GCP_REGION:     ${{ secrets.GCP_REGION }}
+  AR_HOST:        ${{ secrets.GCP_REGION }}-docker.pkg.dev
+  AR_REPO:        copilot
+  BACKEND_SVC:    ai-copilot-backend
+  FRONTEND_SVC:   ai-copilot-frontend
 
 jobs:
-  # ════════════════════════════════════════════════════════════════════
-  # JOB 1: Lint & Test (runs on every push + PR)
-  # ════════════════════════════════════════════════════════════════════
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 1 — Lint & Test (always runs)
+  # ══════════════════════════════════════════════════════════════════
   test:
     name: 🧪 Lint & Test
     runs-on: ubuntu-latest
-
     steps:
-      # ── 1. Checkout ─────────────────────────────────────────────────
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Python setup ─────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          cache: pip
           cache-dependency-path: backend/requirements.txt
 
-      # ── 3. Install backend dependencies ────────────────────────────
       - name: Install dependencies
         working-directory: backend
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest pytest-asyncio httpx ruff
 
-      # ── 4. Lint with Ruff (fast Python linter) ─────────────────────
-      - name: Lint with Ruff
+      - name: Lint (non-blocking)
         working-directory: backend
-        run: |
-          ruff check . --select=E,F,W --ignore=E501 --output-format=github || true
-          # Non-blocking — warnings only, don't fail the build on style issues
+        run: ruff check . --select=E,F,W --ignore=E501 --output-format=github || true
 
-      # ── 5. Run test suite ───────────────────────────────────────────
       - name: Run tests
         working-directory: backend
         env:
-          # CI uses rule-based fallback — no real LLM key needed
-          GROQ_API_KEY: ""
+          GROQ_API_KEY:   ""
           GEMINI_API_KEY: ""
-          GCP_PROJECT_ID: "test-project"
-        run: |
-          python -m pytest tests/ -v --tb=short --junitxml=test-results.xml
+          GCP_PROJECT_ID: test-project
+        run: python -m pytest tests/ -v --tb=short --junitxml=test-results.xml
 
-      # ── 6. Upload test results ──────────────────────────────────────
       - name: Upload test results
         uses: actions/upload-artifact@v4
         if: always()
@@ -92,205 +68,155 @@ jobs:
           path: backend/test-results.xml
           retention-days: 7
 
-  # ════════════════════════════════════════════════════════════════════
-  # JOB 2: Build & Deploy Backend (only on push to main)
-  # ════════════════════════════════════════════════════════════════════
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 2 — Build & Deploy Backend (push to main only)
+  # ══════════════════════════════════════════════════════════════════
   deploy-backend:
-    name: 🚀 Build & Deploy Backend
+    name: 🚀 Deploy Backend
     runs-on: ubuntu-latest
     needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     outputs:
-      backend-url: ${{ steps.deploy.outputs.url }}
-      image-tag:   ${{ steps.meta.outputs.version }}
-
-    permissions:
-      contents: read
-      id-token: write  # Required for Workload Identity Federation
-
-    steps:
-      # ── 1. Checkout ─────────────────────────────────────────────────
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      # ── 2. Generate image metadata (tags + labels) ──────────────────
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.ARTIFACT_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/backend
-          tags: |
-            type=sha,prefix=sha-,format=short
-            type=ref,event=branch
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      # ── 3. Authenticate to GCP ─────────────────────────────────────
-      #   Option A: Workload Identity Federation (recommended, keyless)
-      #   Option B: Service Account JSON key (simpler setup)
-      #   We use Option B here — swap for WIF in production
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-          # For WIF (Option A), replace with:
-          # workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
-          # service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
-
-      # ── 4. Set up gcloud CLI ────────────────────────────────────────
-      - name: Set up gcloud CLI
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.GCP_PROJECT_ID }}
-
-      # ── 5. Configure Docker to use gcloud credentials ──────────────
-      - name: Configure Docker for Artifact Registry
-        run: |
-          gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY }} --quiet
-
-      # ── 6. Set up Docker Buildx (multi-platform, layer caching) ────
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # ── 7. Build and push Docker image ─────────────────────────────
-      - name: Build and push backend image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./backend
-          file: ./backend/Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha                    # GitHub Actions cache
-          cache-to: type=gha,mode=max
-          build-args: |
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
-            GIT_COMMIT=${{ github.sha }}
-
-      # ── 8. Deploy to Cloud Run ──────────────────────────────────────
-      - name: Deploy backend to Cloud Run
-        id: deploy
-        uses: google-github-actions/deploy-cloudrun@v2
-        with:
-          service: ${{ env.BACKEND_SERVICE }}
-          region: ${{ env.GCP_REGION }}
-          image: ${{ env.ARTIFACT_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/backend:latest
-          flags: |
-            --allow-unauthenticated
-            --memory=512Mi
-            --cpu=1
-            --min-instances=0
-            --max-instances=5
-            --concurrency=80
-            --timeout=300
-            --port=8080
-          env_vars: |
-            LOG_LEVEL=INFO
-            GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}
-            GCP_REGION=${{ env.GCP_REGION }}
-          secrets: |
-            GROQ_API_KEY=groq-api-key:latest
-            GEMINI_API_KEY=gemini-api-key:latest
-
-      # ── 9. Smoke test deployed backend ──────────────────────────────
-      - name: Smoke test backend
-        run: |
-          URL="${{ steps.deploy.outputs.url }}"
-          echo "Backend URL: $URL"
-          
-          # Wait up to 60s for service to be ready
-          for i in {1..12}; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/api/ping" || echo "000")
-            if [ "$STATUS" = "200" ]; then
-              echo "✅ Backend healthy (attempt $i)"
-              curl -s "$URL/api/ping" | python3 -m json.tool
-              break
-            fi
-            echo "⏳ Waiting for backend... attempt $i/12 (status=$STATUS)"
-            sleep 5
-          done
-          
-          if [ "$STATUS" != "200" ]; then
-            echo "❌ Backend smoke test failed after 60s"
-            exit 1
-          fi
-
-      # ── 10. Output summary ──────────────────────────────────────────
-      - name: Deployment summary
-        run: |
-          echo "## 🚀 Backend Deployment" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Service | \`${{ env.BACKEND_SERVICE }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Region | \`${{ env.GCP_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Tag | \`${{ steps.meta.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| URL | ${{ steps.deploy.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-
-  # ════════════════════════════════════════════════════════════════════
-  # JOB 3: Build & Deploy Frontend (only on push to main)
-  # ════════════════════════════════════════════════════════════════════
-  deploy-frontend:
-    name: 🎨 Build & Deploy Frontend
-    runs-on: ubuntu-latest
-    needs: deploy-backend
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      backend_url: ${{ steps.deploy.outputs.url }}
 
     permissions:
       contents: read
       id-token: write
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.ARTIFACT_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/frontend
-          tags: |
-            type=sha,prefix=sha-,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Authenticate to Google Cloud
+      - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Set up gcloud CLI
+      - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.GCP_PROJECT_ID }}
 
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY }} --quiet
+      - name: Configure Docker auth
+        run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
 
-      - name: Set up Docker Buildx
+      - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push frontend image
+      - name: Build & push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file:    ./backend/Dockerfile
+          push:    true
+          tags: |
+            ${{ env.AR_HOST }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/backend:latest
+            ${{ env.AR_HOST }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Deploy backend to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.BACKEND_SVC }}
+          region:  ${{ env.GCP_REGION }}
+          image:   ${{ env.AR_HOST }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/backend:${{ github.sha }}
+          flags: >-
+            --allow-unauthenticated
+            --memory=512Mi
+            --cpu=1
+            --min-instances=0
+            --max-instances=5
+            --port=8080
+            --timeout=300
+          env_vars: >-
+            LOG_LEVEL=INFO,
+            GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},
+            GCP_REGION=${{ env.GCP_REGION }}
+          secrets: >-
+            GROQ_API_KEY=groq-api-key:latest
+
+      - name: Smoke test backend
+        run: |
+          URL="${{ steps.deploy.outputs.url }}"
+          echo "Backend URL: $URL"
+          for i in $(seq 1 12); do
+            HTTP=$(curl -sf -o /dev/null -w "%{http_code}" "$URL/api/ping" || echo 000)
+            if [ "$HTTP" = "200" ]; then
+              echo "✅ Backend healthy"
+              curl -s "$URL/api/ping"
+              break
+            fi
+            echo "⏳ Attempt $i/12 — HTTP $HTTP — waiting 5s..."
+            sleep 5
+          done
+          [ "$HTTP" = "200" ] || (echo "❌ Smoke test failed" && exit 1)
+
+      - name: Summary
+        run: |
+          echo "## 🚀 Backend Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| URL | ${{ steps.deploy.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ══════════════════════════════════════════════════════════════════
+  # JOB 3 — Build & Deploy Frontend (after backend)
+  # ══════════════════════════════════════════════════════════════════
+  deploy-frontend:
+    name: 🎨 Deploy Frontend
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Configure Docker auth
+        run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Build frontend with backend URL baked in ─────────────────
+      - name: Build & push frontend image
         uses: docker/build-push-action@v5
         with:
           context: ./frontend
-          file: ./frontend/Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          file:    ./frontend/Dockerfile
+          push:    true
+          tags: |
+            ${{ env.AR_HOST }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/frontend:latest
+            ${{ env.AR_HOST }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/frontend:${{ github.sha }}
           build-args: |
-            VITE_API_URL=${{ needs.deploy-backend.outputs.backend-url }}/api
+            VITE_API_URL=${{ needs.deploy-backend.outputs.backend_url }}/api
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
 
       - name: Deploy frontend to Cloud Run
         id: deploy
         uses: google-github-actions/deploy-cloudrun@v2
         with:
-          service: ${{ env.FRONTEND_SERVICE }}
-          region: ${{ env.GCP_REGION }}
-          image: ${{ env.ARTIFACT_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/frontend:latest
-          flags: |
+          service: ${{ env.FRONTEND_SVC }}
+          region:  ${{ env.GCP_REGION }}
+          image:   ${{ env.AR_HOST }}/${{ env.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/frontend:${{ github.sha }}
+          flags: >-
             --allow-unauthenticated
             --memory=256Mi
             --cpu=1
@@ -298,15 +224,11 @@ jobs:
             --max-instances=3
             --port=8080
 
-      - name: Final deployment summary
+      - name: Final summary
         run: |
-          echo "## 🎉 Full Deployment Complete!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | URL |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎉 Deployment Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|" >> $GITHUB_STEP_SUMMARY
           echo "| 🌐 Frontend | ${{ steps.deploy.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| ⚙️ Backend | ${{ needs.deploy-backend.outputs.backend-url }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 📖 API Docs | ${{ needs.deploy-backend.outputs.backend-url }}/docs |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚙️ Backend  | ${{ needs.deploy-backend.outputs.backend_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📖 API Docs | ${{ needs.deploy-backend.outputs.backend_url }}/docs |" >> $GITHUB_STEP_SUMMARY

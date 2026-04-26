@@ -1,15 +1,25 @@
+// API URL is baked in at build time via VITE_API_URL env var
+// Falls back to localhost for local development
 const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000/api'
 
 async function req(path, opts = {}) {
-  const res = await fetch(`${BASE}${path}`, {
+  const url = `${BASE}${path}`
+  
+  const res = await fetch(url, {
     headers: { 'Content-Type': 'application/json' },
+    mode: 'cors',
     ...opts,
   })
-  if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`)
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => `HTTP ${res.status}`)
+    throw new Error(`API ${res.status}: ${text}`)
+  }
   return res.json()
 }
 
 export const api = {
+  // Chat
   chat: (message, session_id, history = []) =>
     req('/chat', {
       method: 'POST',
@@ -18,6 +28,7 @@ export const api = {
 
   session: (session_id) => req(`/session/${session_id}`),
 
+  // Deployments
   deployments: (limit = 20) => req(`/deployments?limit=${limit}`),
   deploy: (app_name, version = 'latest', repo_url = '') =>
     req('/deploy', {
@@ -30,18 +41,22 @@ export const api = {
       body: JSON.stringify({ app_name, version }),
     }),
   rollback: (app_name, reason = 'Manual rollback') =>
-    req('/rollback', { method: 'POST', body: JSON.stringify({ app_name, reason }) }),
+    req('/rollback', {
+      method: 'POST',
+      body: JSON.stringify({ app_name, reason }),
+    }),
 
   cloudRunServices: () => req('/cloud-run/services'),
 
+  // Logs & Health
   logs: (limit = 50, level, service) => {
     const params = new URLSearchParams({ limit })
-    if (level) params.set('level', level)
+    if (level)   params.set('level', level)
     if (service) params.set('service', service)
     return req(`/logs?${params}`)
   },
 
-  health: () => req('/health'),
+  health:    () => req('/health'),
   incidents: (status) => req(`/incidents${status ? `?status=${status}` : ''}`),
-  ping: () => req('/ping'),
+  ping:      () => req('/ping'),
 }
