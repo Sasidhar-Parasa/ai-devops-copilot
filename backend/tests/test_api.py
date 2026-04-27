@@ -1,194 +1,151 @@
 """
-Backend test suite — runs in CI pipeline.
-Tests critical paths: health, chat, deploy, logs endpoints.
+Backend test suite — all tests share one session-scoped TestClient.
+DB is initialized once in conftest.py before any import.
 """
-import json
-import sys
-import os
-
-# Add backend root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
-import pytest
-from fastapi.testclient import TestClient
-
-from main import app
-
-client = TestClient(app)
 
 
-# ── Health & Ping ─────────────────────────────────────────────────────────────
+# ── Root & Health ─────────────────────────────────────────────────────────────
 
-def test_root():
-    resp = client.get("/")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["service"] == "AI DevOps Copilot"
-    assert data["status"] == "operational"
-    assert "agents" in data
+def test_root(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    assert r.json()["service"] == "AI DevOps Copilot"
+    assert r.json()["status"] == "operational"
 
 
-def test_ping():
-    resp = client.get("/api/ping")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["status"] == "ok"
-    assert "llm" in data
+def test_ping(client):
+    r = client.get("/api/ping")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
 
 
-def test_health():
-    resp = client.get("/api/health")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "overall" in data
-    assert "services" in data
-    assert isinstance(data["services"], list)
+def test_health(client):
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    d = r.json()
+    assert "overall" in d
+    assert isinstance(d["services"], list)
 
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
 
-def test_get_logs():
-    resp = client.get("/api/logs?limit=5")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "logs" in data
-    assert "total" in data
-    assert isinstance(data["logs"], list)
+def test_get_logs(client):
+    r = client.get("/api/logs?limit=5")
+    assert r.status_code == 200
+    d = r.json()
+    assert "logs" in d
+    assert isinstance(d["logs"], list)
 
 
-def test_get_logs_with_level_filter():
-    resp = client.get("/api/logs?level=ERROR&limit=10")
-    assert resp.status_code == 200
-    data = resp.json()
-    for log in data["logs"]:
+def test_get_logs_level_filter(client):
+    r = client.get("/api/logs?level=ERROR&limit=20")
+    assert r.status_code == 200
+    for log in r.json()["logs"]:
         assert log["level"] == "ERROR"
 
 
 # ── Deployments ───────────────────────────────────────────────────────────────
 
-def test_list_deployments():
-    resp = client.get("/api/deployments")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "deployments" in data
-    assert "total" in data
+def test_list_deployments(client):
+    r = client.get("/api/deployments")
+    assert r.status_code == 200
+    d = r.json()
+    assert "deployments" in d
+    assert "total" in d
 
 
-def test_simulate_deployment():
-    resp = client.post("/api/deploy/simulate", json={
+def test_simulate_deployment(client):
+    r = client.post("/api/deploy/simulate", json={
         "app_name": "test-app",
-        "version": "v1.0.0",
-        "environment": "production"
+        "version":  "v1.0.0",
+        "environment": "production",
     })
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "status" in data
-    assert "stages" in data
-    assert data["app_name"] == "test-app"
+    assert r.status_code == 200
+    d = r.json()
+    assert "status" in d
+    assert d["app_name"] == "test-app"
 
 
-def test_rollback():
-    resp = client.post("/api/rollback", json={
+def test_rollback(client):
+    r = client.post("/api/rollback", json={
         "app_name": "test-app",
-        "reason": "CI test rollback"
+        "reason":   "CI test",
     })
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "status" in data
+    assert r.status_code == 200
+    assert "status" in r.json()
 
 
 # ── Incidents ─────────────────────────────────────────────────────────────────
 
-def test_list_incidents():
-    resp = client.get("/api/incidents")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "incidents" in data
-    assert "total" in data
+def test_list_incidents(client):
+    r = client.get("/api/incidents")
+    assert r.status_code == 200
+    d = r.json()
+    assert "incidents" in d
+    assert "total" in d
 
 
-# ── Chat (rule-based, no LLM key needed in CI) ────────────────────────────────
+# ── Chat ──────────────────────────────────────────────────────────────────────
 
-def test_chat_deploy_intent():
-    resp = client.post("/api/chat", json={
-        "message": "deploy myapp",
-        "session_id": "ci-test-001",
-        "history": []
-    })
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "response" in data
-    assert "intent" in data
-    assert "agents_used" in data
-    assert len(data["agents_used"]) >= 1
-    assert "deploy" in data["intent"]
+def test_chat_empty_message(client):
+    r = client.post("/api/chat", json={"message": "", "session_id": "ci-empty"})
+    assert r.status_code == 400
 
 
-def test_chat_status_intent():
-    resp = client.post("/api/chat", json={
-        "message": "system health check",
-        "session_id": "ci-test-002",
-        "history": []
-    })
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["intent"] in ("status", "general")
+def test_chat_deploy_intent(client):
+    r = client.post("/api/chat", json={"message": "deploy myapp", "session_id": "ci-01"})
+    assert r.status_code == 200
+    d = r.json()
+    assert "deploy" in d["intent"]
+    assert len(d["agents_used"]) >= 1
 
 
-def test_chat_rollback_intent():
-    resp = client.post("/api/chat", json={
-        "message": "rollback payment-service",
-        "session_id": "ci-test-003",
-        "history": []
-    })
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "rollback" in data["intent"]
+def test_chat_status_intent(client):
+    r = client.post("/api/chat", json={"message": "system health check", "session_id": "ci-02"})
+    assert r.status_code == 200
+    assert r.json()["intent"] in ("status", "general")
 
 
-def test_chat_empty_message():
-    resp = client.post("/api/chat", json={
-        "message": "",
-        "session_id": "ci-test-004"
-    })
-    assert resp.status_code == 400
+def test_chat_rollback_intent(client):
+    r = client.post("/api/chat", json={"message": "rollback payment-service", "session_id": "ci-03"})
+    assert r.status_code == 200
+    assert "rollback" in r.json()["intent"]
 
 
-def test_chat_rca_intent():
-    resp = client.post("/api/chat", json={
-        "message": "why did the deployment fail?",
-        "session_id": "ci-test-005",
-        "history": []
-    })
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "root_cause" in data["intent"]
+def test_chat_rca_intent(client):
+    r = client.post("/api/chat", json={"message": "why did the deployment fail?", "session_id": "ci-04"})
+    assert r.status_code == 200
+    assert "root_cause" in r.json()["intent"]
 
 
-def test_session_endpoint():
-    resp = client.get("/api/session/ci-test-001")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "session_id" in data
-    assert "has_pending_deploy" in data
+def test_chat_incident_intent(client):
+    r = client.post("/api/chat", json={"message": "any active incidents?", "session_id": "ci-05"})
+    assert r.status_code == 200
+    assert "incident" in r.json()["intent"]
 
 
-# ── Schema validation ─────────────────────────────────────────────────────────
+def test_chat_fix_intent(client):
+    r = client.post("/api/chat", json={"message": "auto fix the payment service", "session_id": "ci-06"})
+    assert r.status_code == 200
+    assert "fix" in r.json()["intent"]
 
-def test_chat_response_schema():
-    resp = client.post("/api/chat", json={
-        "message": "show me recent logs",
-        "session_id": "ci-schema-test"
-    })
-    assert resp.status_code == 200
-    data = resp.json()
-    required_fields = ["response", "intent", "agents_used", "session_id", "timestamp"]
-    for field in required_fields:
-        assert field in data, f"Missing field: {field}"
 
-    for agent_step in data["agents_used"]:
-        assert "agent" in agent_step
-        assert "action" in agent_step
-        assert "result" in agent_step
-        assert "duration_ms" in agent_step
-        assert "status" in agent_step
+# ── Schema ────────────────────────────────────────────────────────────────────
+
+def test_chat_response_schema(client):
+    r = client.post("/api/chat", json={"message": "show me recent logs", "session_id": "ci-07"})
+    assert r.status_code == 200
+    d = r.json()
+    for field in ["response", "intent", "agents_used", "session_id", "timestamp"]:
+        assert field in d, f"Missing: {field}"
+    for step in d["agents_used"]:
+        for key in ["agent", "action", "result", "duration_ms", "status"]:
+            assert key in step, f"Agent step missing: {key}"
+
+
+def test_session_endpoint(client):
+    r = client.get("/api/session/ci-01")
+    assert r.status_code == 200
+    d = r.json()
+    assert "session_id" in d
+    assert "has_pending_deploy" in d

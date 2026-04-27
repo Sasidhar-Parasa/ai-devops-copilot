@@ -3,6 +3,7 @@ SQLite Database Service
 """
 import json
 import logging
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -10,11 +11,14 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path("./data/copilot.db")
+# Tests override this via TEST_DB_PATH env var (set in conftest.py before import)
+DB_PATH = Path(os.getenv("TEST_DB_PATH", "./data/copilot.db"))
 
 
 def get_conn() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(exist_ok=True)
+    # Only create parent dir for the real DB, not temp test files
+    if "TEST_DB_PATH" not in os.environ:
+        DB_PATH.parent.mkdir(exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -82,7 +86,6 @@ def _seed_sample_data():
     conn = get_conn()
     cur = conn.cursor()
 
-    # Check if already seeded
     cur.execute("SELECT COUNT(*) FROM logs")
     if cur.fetchone()[0] > 0:
         conn.close()
@@ -93,34 +96,31 @@ def _seed_sample_data():
 
     now = datetime.utcnow()
 
-    # Sample logs
     sample_logs = [
-        ("INFO",  "api-gateway",     "Request processed: POST /api/deploy [200] 142ms"),
-        ("INFO",  "auth-service",    "JWT token validated for user: admin@devops.io"),
-        ("WARN",  "payment-service", "Response time elevated: 892ms (threshold: 500ms)"),
-        ("ERROR", "payment-service", "Database connection timeout after 30s retries"),
-        ("INFO",  "deploy-agent",    "Build pipeline started: myapp v2.4.1"),
-        ("INFO",  "deploy-agent",    "Docker image built successfully: myapp:2.4.1"),
-        ("INFO",  "deploy-agent",    "Unit tests passed: 247/247"),
-        ("ERROR", "deploy-agent",    "Integration test failed: TestCheckoutFlow - assertion error"),
-        ("WARN",  "monitoring",      "CPU usage spike detected: payment-service 87%"),
-        ("CRITICAL","incident-agent","Service degradation detected: payment-service error rate 23%"),
-        ("INFO",  "fix-agent",       "Auto-scaling triggered: payment-service replicas 2→4"),
-        ("INFO",  "api-gateway",     "Health check: all services nominal"),
-        ("INFO",  "auth-service",    "OAuth2 callback successful for github integration"),
-        ("WARN",  "database",        "Slow query detected: SELECT * FROM orders (2.3s)"),
-        ("INFO",  "deploy-agent",    "Rollback initiated: payment-service v2.3.9→v2.3.8"),
+        ("INFO",     "api-gateway",     "Request processed: POST /api/deploy [200] 142ms"),
+        ("INFO",     "auth-service",    "JWT token validated for user: admin@devops.io"),
+        ("WARN",     "payment-service", "Response time elevated: 892ms (threshold: 500ms)"),
+        ("ERROR",    "payment-service", "Database connection timeout after 30s retries"),
+        ("INFO",     "deploy-agent",    "Build pipeline started: myapp v2.4.1"),
+        ("INFO",     "deploy-agent",    "Docker image built successfully: myapp:2.4.1"),
+        ("INFO",     "deploy-agent",    "Unit tests passed: 247/247"),
+        ("ERROR",    "deploy-agent",    "Integration test failed: TestCheckoutFlow - assertion error"),
+        ("WARN",     "monitoring",      "CPU usage spike detected: payment-service 87%"),
+        ("CRITICAL", "incident-agent",  "Service degradation detected: payment-service error rate 23%"),
+        ("INFO",     "fix-agent",       "Auto-scaling triggered: payment-service replicas 2→4"),
+        ("INFO",     "api-gateway",     "Health check: all services nominal"),
+        ("INFO",     "auth-service",    "OAuth2 callback successful for github integration"),
+        ("WARN",     "database",        "Slow query detected: SELECT * FROM orders (2.3s)"),
+        ("INFO",     "deploy-agent",    "Rollback initiated: payment-service v2.3.9→v2.3.8"),
     ]
 
     for i, (level, service, message) in enumerate(sample_logs):
         ts = (now - timedelta(minutes=len(sample_logs) - i)).isoformat()
         cur.execute(
             "INSERT INTO logs VALUES (?,?,?,?,?,?)",
-            (str(uuid.uuid4()), ts, level, service, message, "{}")
+            (str(uuid.uuid4()), ts, level, service, message, "{}"),
         )
 
-    # Sample deployments
-    import json
     stages_success = json.dumps([
         {"name": "Build",  "status": "success", "duration_seconds": 47},
         {"name": "Test",   "status": "success", "duration_seconds": 123},
@@ -137,17 +137,16 @@ def _seed_sample_data():
         stages_success,
         (now - timedelta(hours=3)).isoformat(),
         (now - timedelta(hours=2, minutes=57)).isoformat(),
-        "user", None
+        "user", None,
     ))
     cur.execute("INSERT INTO deployments VALUES (?,?,?,?,?,?,?,?,?,?)", (
         "dep-002", "payment-service", "v2.4.1", "production", "failed",
         stages_failed,
         (now - timedelta(hours=1)).isoformat(),
         (now - timedelta(minutes=50)).isoformat(),
-        "CI/CD", "Integration test TestCheckoutFlow failed"
+        "CI/CD", "Integration test TestCheckoutFlow failed",
     ))
 
-    # Sample incidents
     cur.execute("INSERT INTO incidents VALUES (?,?,?,?,?,?,?,?,?,?)", (
         "inc-001",
         "Payment Service Degradation",
@@ -156,7 +155,7 @@ def _seed_sample_data():
         "Integration test regression in checkout flow introduced in v2.4.1",
         None,
         (now - timedelta(minutes=55)).isoformat(),
-        None
+        None,
     ))
 
     conn.commit()
@@ -164,7 +163,7 @@ def _seed_sample_data():
     logger.info("Sample data seeded")
 
 
-# ─── CRUD Helpers ─────────────────────────────────────────────────────────────
+# ── CRUD Helpers ──────────────────────────────────────────────────────────────
 
 def save_deployment(dep: dict):
     conn = get_conn()
