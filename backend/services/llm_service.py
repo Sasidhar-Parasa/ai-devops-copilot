@@ -40,7 +40,7 @@ CONVERSATIONAL EXAMPLES:
 User: "deploy myapp"
 → intent: deploy_request, ask for GitHub repo URL
 
-User: "deploy https://github.com/user/myapp"  
+User: "deploy https://github.com/user/myapp"
 → intent: deploy_with_repo, extract repo_url
 
 User: "here's the repo: https://github.com/acme/api"

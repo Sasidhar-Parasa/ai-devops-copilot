@@ -1,11 +1,11 @@
 """
-Fix Agent – Suggests and simulates automated remediation
+Fix Agent - Suggests and simulates automated remediation
 """
 import logging
 from datetime import datetime
 from typing import Any, Dict
 
-from services.database import save_incident, get_incidents
+from services.database import save_incident
 
 logger = logging.getLogger(__name__)
 
@@ -17,70 +17,68 @@ class FixAgent:
 
         if not open_incidents:
             return {
-                "fix_applied": "No active incidents requiring fixes",
+                "fix_applied":  "No active incidents requiring fixes",
                 "actions_taken": [],
-                "status": "no_action_needed",
+                "status":       "no_action_needed",
             }
 
         actions = []
-        for inc in open_incidents[:2]:  # Fix up to 2 incidents
+        for inc in open_incidents[:2]:
             fix = self._select_fix(inc)
             actions.append(fix)
-
-            # Mark incident as resolved in DB
-            inc["status"] = "resolved"
+            inc["status"]      = "resolved"
             inc["fix_applied"] = fix["action"]
             inc["resolved_at"] = datetime.utcnow().isoformat()
             try:
                 save_incident(inc)
-            except Exception as e:
-                logger.warning(f"Could not update incident: {e}")
+            except Exception as exc:
+                logger.warning("Could not update incident: %s", exc)
 
         return {
-            "fix_applied": actions[0]["action"] if actions else "General remediation",
-            "actions_taken": actions,
-            "status": "remediated",
+            "fix_applied":            actions[0]["action"] if actions else "General remediation",
+            "actions_taken":          actions,
+            "status":                 "remediated",
             "estimated_recovery_time": "2-5 minutes",
         }
 
     def _select_fix(self, incident: Dict) -> Dict[str, Any]:
         severity = incident.get("severity", "medium")
-        service = incident.get("service", "unknown")
+        service  = incident.get("service", "unknown")
 
         fixes = {
             "critical": {
-                "action": f"Emergency rollback of {service} to last stable version",
-                "type": "rollback",
+                "action":    f"Emergency rollback of {service} to last stable version",
+                "type":      "rollback",
                 "automated": True,
-                "commands": [
+                "commands":  [
                     f"kubectl rollout undo deployment/{service}",
                     f"kubectl rollout status deployment/{service}",
                 ],
             },
             "high": {
-                "action": f"Auto-scale {service}: replicas 2 → 6 + circuit breaker enabled",
-                "type": "scale_out",
+                "action":    f"Auto-scale {service}: replicas 2 → 6 + circuit breaker enabled",
+                "type":      "scale_out",
                 "automated": True,
-                "commands": [
+                "commands":  [
                     f"kubectl scale deployment/{service} --replicas=6",
                     f"kubectl annotate deployment/{service} circuit-breaker=enabled",
                 ],
             },
             "medium": {
-                "action": f"Restart {service} pods + increase memory limit 512Mi → 1Gi",
-                "type": "restart_and_resize",
+                "action":    f"Restart {service} pods + increase memory limit 512Mi → 1Gi",
+                "type":      "restart_and_resize",
                 "automated": True,
-                "commands": [
+                "commands":  [
                     f"kubectl rollout restart deployment/{service}",
                     f"kubectl set resources deployment/{service} --limits=memory=1Gi",
                 ],
             },
             "low": {
-                "action": f"Drain and reschedule {service} pods to less-loaded nodes",
-                "type": "reschedule",
+                "action":    f"Drain and reschedule {service} pods to less-loaded nodes",
+                "type":      "reschedule",
                 "automated": False,
-                "commands": [
-                    f"kubectl drain node --ignore-daemonsets",
+                "commands":  [
+                    "kubectl drain node --ignore-daemonsets",
                     f"kubectl rollout restart deployment/{service}",
                 ],
             },

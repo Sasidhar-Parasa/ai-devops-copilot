@@ -7,8 +7,8 @@ import asyncio
 import logging
 import os
 import subprocess
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -121,14 +121,14 @@ async def get_real_monitoring_data() -> Dict[str, Any]:
             )
             all_logs.extend(logs)
 
-        errors = [l for l in all_logs if l["level"] in ("ERROR", "CRITICAL")]
+        errors = [entry for entry in all_logs if entry["level"] in ("ERROR", "CRITICAL")]
         error_rate = (len(errors) / len(all_logs) * 100) if all_logs else 0
 
         return {
             "source": "gcp_real",
             "log_count": len(all_logs),
             "error_count": len(errors),
-            "warning_count": len([l for l in all_logs if l["level"] == "WARN"]),
+            "warning_count": len([entry for entry in all_logs if entry["level"] == "WARN"]),
             "error_rate": round(error_rate, 2),
             "recent_errors": errors[:5],
             "recent_logs": all_logs[:10],
@@ -138,13 +138,13 @@ async def get_real_monitoring_data() -> Dict[str, Any]:
         # Simulated data for dev/demo
         from services.database import get_logs
         logs = get_logs(limit=50)
-        errors = [l for l in logs if l["level"] in ("ERROR", "CRITICAL")]
+        errors = [entry for entry in logs if entry["level"] in ("ERROR", "CRITICAL")]
         error_rate = (len(errors) / len(logs) * 100) if logs else 0
         return {
             "source": "simulated",
             "log_count": len(logs),
             "error_count": len(errors),
-            "warning_count": len([l for l in logs if l["level"] == "WARN"]),
+            "warning_count": len([entry for entry in logs if entry["level"] == "WARN"]),
             "error_rate": round(error_rate, 2),
             "recent_errors": errors[:5],
             "recent_logs": logs[:10],

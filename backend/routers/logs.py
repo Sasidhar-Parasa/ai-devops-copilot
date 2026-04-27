@@ -19,9 +19,9 @@ async def fetch_logs(
     """Fetch system logs with optional filters."""
     logs = get_logs(limit=limit, level=level)
     if service:
-        logs = [l for l in logs if l["service"] == service]
+        logs = [entry for entry in logs if entry["service"] == service]
 
-    errors = [l for l in logs if l["level"] in ("ERROR", "CRITICAL")]
+    errors = [entry for entry in logs if entry["level"] in ("ERROR", "CRITICAL")]
     error_rate = (len(errors) / len(logs) * 100) if logs else 0
 
     return {
