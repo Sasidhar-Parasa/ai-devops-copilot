@@ -1,5 +1,5 @@
 """
-SQLite Database Service
+SQLite Database Service — stores only real deployments, no seeded demo data.
 """
 import json
 import logging
@@ -7,16 +7,14 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Tests override this via TEST_DB_PATH env var (set in conftest.py before import)
 DB_PATH = Path(os.getenv("TEST_DB_PATH", "./data/copilot.db"))
 
 
 def get_conn() -> sqlite3.Connection:
-    # Only create parent dir for the real DB, not temp test files
     if "TEST_DB_PATH" not in os.environ:
         DB_PATH.parent.mkdir(exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
@@ -26,29 +24,29 @@ def get_conn() -> sqlite3.Connection:
 
 def init_db():
     conn = get_conn()
-    cur = conn.cursor()
-
-    cur.executescript("""
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS deployments (
-            id          TEXT PRIMARY KEY,
-            app_name    TEXT NOT NULL,
-            version     TEXT NOT NULL,
-            environment TEXT NOT NULL,
-            status      TEXT NOT NULL,
-            stages      TEXT NOT NULL,
-            created_at  TEXT NOT NULL,
-            completed_at TEXT,
-            triggered_by TEXT DEFAULT 'user',
-            error_message TEXT
+            id            TEXT PRIMARY KEY,
+            app_name      TEXT NOT NULL,
+            version       TEXT NOT NULL,
+            environment   TEXT NOT NULL DEFAULT 'production',
+            status        TEXT NOT NULL,
+            stages        TEXT NOT NULL DEFAULT '[]',
+            created_at    TEXT NOT NULL,
+            completed_at  TEXT,
+            triggered_by  TEXT DEFAULT 'user',
+            error_message TEXT,
+            service_url   TEXT DEFAULT '',
+            repo_url      TEXT DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS logs (
-            id          TEXT PRIMARY KEY,
-            timestamp   TEXT NOT NULL,
-            level       TEXT NOT NULL,
-            service     TEXT NOT NULL,
-            message     TEXT NOT NULL,
-            metadata    TEXT DEFAULT '{}'
+            id        TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            level     TEXT NOT NULL,
+            service   TEXT NOT NULL,
+            message   TEXT NOT NULL,
+            metadata  TEXT DEFAULT '{}'
         );
 
         CREATE TABLE IF NOT EXISTS incidents (
@@ -63,130 +61,80 @@ def init_db():
             created_at  TEXT NOT NULL,
             resolved_at TEXT
         );
-
-        CREATE TABLE IF NOT EXISTS chat_sessions (
-            id          TEXT PRIMARY KEY,
-            session_id  TEXT NOT NULL,
-            role        TEXT NOT NULL,
-            content     TEXT NOT NULL,
-            agent       TEXT,
-            timestamp   TEXT NOT NULL
-        );
     """)
-
     conn.commit()
     conn.close()
-    logger.info("Database tables ready")
-
-    _seed_sample_data()
+    logger.info("Database ready: %s", DB_PATH)
 
 
-def _seed_sample_data():
-    """Seed realistic sample data for demo."""
+# ── Deployments ────────────────────────────────────────────────────────────────
+
+def save_deployment(dep: Dict[str, Any]):
+    dep.setdefault("service_url", "")
+    dep.setdefault("repo_url", "")
     conn = get_conn()
-    cur = conn.cursor()
+    # Add columns if they didn't exist before
+    try:
+        conn.execute("ALTER TABLE deployments ADD COLUMN service_url TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        conn.execute("ALTER TABLE deployments ADD COLUMN repo_url TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
 
-    cur.execute("SELECT COUNT(*) FROM logs")
-    if cur.fetchone()[0] > 0:
-        conn.close()
-        return
-
-    import uuid
-    from datetime import timedelta
-
-    now = datetime.utcnow()
-
-    sample_logs = [
-        ("INFO",     "api-gateway",     "Request processed: POST /api/deploy [200] 142ms"),
-        ("INFO",     "auth-service",    "JWT token validated for user: admin@devops.io"),
-        ("WARN",     "payment-service", "Response time elevated: 892ms (threshold: 500ms)"),
-        ("ERROR",    "payment-service", "Database connection timeout after 30s retries"),
-        ("INFO",     "deploy-agent",    "Build pipeline started: myapp v2.4.1"),
-        ("INFO",     "deploy-agent",    "Docker image built successfully: myapp:2.4.1"),
-        ("INFO",     "deploy-agent",    "Unit tests passed: 247/247"),
-        ("ERROR",    "deploy-agent",    "Integration test failed: TestCheckoutFlow - assertion error"),
-        ("WARN",     "monitoring",      "CPU usage spike detected: payment-service 87%"),
-        ("CRITICAL", "incident-agent",  "Service degradation detected: payment-service error rate 23%"),
-        ("INFO",     "fix-agent",       "Auto-scaling triggered: payment-service replicas 2→4"),
-        ("INFO",     "api-gateway",     "Health check: all services nominal"),
-        ("INFO",     "auth-service",    "OAuth2 callback successful for github integration"),
-        ("WARN",     "database",        "Slow query detected: SELECT * FROM orders (2.3s)"),
-        ("INFO",     "deploy-agent",    "Rollback initiated: payment-service v2.3.9→v2.3.8"),
-    ]
-
-    for i, (level, service, message) in enumerate(sample_logs):
-        ts = (now - timedelta(minutes=len(sample_logs) - i)).isoformat()
-        cur.execute(
-            "INSERT INTO logs VALUES (?,?,?,?,?,?)",
-            (str(uuid.uuid4()), ts, level, service, message, "{}"),
-        )
-
-    stages_success = json.dumps([
-        {"name": "Build",  "status": "success", "duration_seconds": 47},
-        {"name": "Test",   "status": "success", "duration_seconds": 123},
-        {"name": "Deploy", "status": "success", "duration_seconds": 34},
-    ])
-    stages_failed = json.dumps([
-        {"name": "Build",  "status": "success", "duration_seconds": 52},
-        {"name": "Test",   "status": "failed",  "duration_seconds": 89},
-        {"name": "Deploy", "status": "pending", "duration_seconds": None},
-    ])
-
-    cur.execute("INSERT INTO deployments VALUES (?,?,?,?,?,?,?,?,?,?)", (
-        "dep-001", "myapp", "v2.4.0", "production", "success",
-        stages_success,
-        (now - timedelta(hours=3)).isoformat(),
-        (now - timedelta(hours=2, minutes=57)).isoformat(),
-        "user", None,
-    ))
-    cur.execute("INSERT INTO deployments VALUES (?,?,?,?,?,?,?,?,?,?)", (
-        "dep-002", "payment-service", "v2.4.1", "production", "failed",
-        stages_failed,
-        (now - timedelta(hours=1)).isoformat(),
-        (now - timedelta(minutes=50)).isoformat(),
-        "CI/CD", "Integration test TestCheckoutFlow failed",
-    ))
-
-    cur.execute("INSERT INTO incidents VALUES (?,?,?,?,?,?,?,?,?,?)", (
-        "inc-001",
-        "Payment Service Degradation",
-        "high", "investigating", "payment-service",
-        "Error rate spiked to 23% following v2.4.1 deployment failure.",
-        "Integration test regression in checkout flow introduced in v2.4.1",
-        None,
-        (now - timedelta(minutes=55)).isoformat(),
-        None,
-    ))
-
-    conn.commit()
-    conn.close()
-    logger.info("Sample data seeded")
-
-
-# ── CRUD Helpers ──────────────────────────────────────────────────────────────
-
-def save_deployment(dep: dict):
-    conn = get_conn()
     conn.execute(
         """INSERT OR REPLACE INTO deployments
-           VALUES (:id,:app_name,:version,:environment,:status,:stages,
-                   :created_at,:completed_at,:triggered_by,:error_message)""",
-        dep,
+           (id, app_name, version, environment, status, stages,
+            created_at, completed_at, triggered_by, error_message, service_url, repo_url)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            dep["id"], dep["app_name"], dep["version"],
+            dep.get("environment", "production"), dep["status"],
+            dep.get("stages", "[]"),
+            dep["created_at"], dep.get("completed_at"),
+            dep.get("triggered_by", "user"), dep.get("error_message"),
+            dep.get("service_url", ""), dep.get("repo_url", ""),
+        ),
     )
     conn.commit()
     conn.close()
 
 
-def get_deployments(limit: int = 20) -> List[dict]:
+def get_deployments(limit: int = 20) -> List[Dict]:
     conn = get_conn()
     rows = conn.execute(
         "SELECT * FROM deployments ORDER BY created_at DESC LIMIT ?", (limit,)
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    result = []
+    for row in rows:
+        d = dict(row)
+        if isinstance(d.get("stages"), str):
+            try:
+                d["stages"] = json.loads(d["stages"])
+            except Exception:  # noqa: BLE001
+                d["stages"] = []
+        result.append(d)
+    return result
 
 
-def get_logs(limit: int = 100, level: Optional[str] = None) -> List[dict]:
+# ── Logs (from real Cloud Run — written on deploy events) ──────────────────────
+
+def append_log(level: str, service: str, message: str):
+    import uuid
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?)",
+        (str(uuid.uuid4()), datetime.utcnow().isoformat(), level, service, message, "{}"),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_logs(limit: int = 100, level: Optional[str] = None) -> List[Dict]:
     conn = get_conn()
     if level:
         rows = conn.execute(
@@ -201,31 +149,31 @@ def get_logs(limit: int = 100, level: Optional[str] = None) -> List[dict]:
     return [dict(r) for r in rows]
 
 
-def save_log(entry: dict):
+def save_log(entry: Dict):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO logs VALUES (:id,:timestamp,:level,:service,:message,:metadata)",
+        "INSERT OR IGNORE INTO logs VALUES (:id,:timestamp,:level,:service,:message,:metadata)",
         entry,
     )
     conn.commit()
     conn.close()
 
 
-def get_incidents(status: Optional[str] = None) -> List[dict]:
+# ── Incidents ──────────────────────────────────────────────────────────────────
+
+def get_incidents(status: Optional[str] = None) -> List[Dict]:
     conn = get_conn()
     if status:
         rows = conn.execute(
             "SELECT * FROM incidents WHERE status=? ORDER BY created_at DESC", (status,)
         ).fetchall()
     else:
-        rows = conn.execute(
-            "SELECT * FROM incidents ORDER BY created_at DESC"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM incidents ORDER BY created_at DESC").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def save_incident(inc: dict):
+def save_incident(inc: Dict):
     conn = get_conn()
     conn.execute(
         """INSERT OR REPLACE INTO incidents

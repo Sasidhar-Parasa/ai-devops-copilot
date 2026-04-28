@@ -5,7 +5,7 @@ import { ChatMessage, TypingIndicator, PendingDeployBanner } from '../components
 import { ChatInput } from '../components/chat/ChatInput'
 
 export function ChatPage() {
-  const { messages, loading, sendMessage, pendingDeploy, sessionId } = useChat()
+  const { messages, loading, sendMessage, pendingDeploy } = useChat()
   const bottomRef = useRef(null)
 
   useEffect(() => {
@@ -19,24 +19,24 @@ export function ChatPage() {
         style={{ borderColor: 'var(--border)', background: 'rgba(11,15,26,0.6)' }}>
         <div className="flex items-center gap-3">
           <div className="w-9 h-9 rounded-xl flex items-center justify-center"
-            style={{ background: 'rgba(0,229,255,0.12)', border: '1px solid rgba(0,229,255,0.25)' }}>
+            style={{ background: 'rgba(0,229,255,0.1)', border: '1px solid rgba(0,229,255,0.22)' }}>
             <Bot size={18} className="neon-cyan" />
           </div>
           <div>
             <h1 className="font-display font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>
-              Copilot Chat
+              DevOps Copilot
             </h1>
             <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
-              Groq llama3-70b · 6 specialized agents · Real GCP deployments
+              Powered by Groq llama3-70b · 6 specialized agents
             </p>
           </div>
         </div>
         <div className="flex items-center gap-3">
           {pendingDeploy && (
-            <div className="flex items-center gap-1.5 text-xs px-2 py-1 rounded-full animate-pulse-slow"
-              style={{ background: 'rgba(0,229,255,0.1)', border: '1px solid rgba(0,229,255,0.3)', color: 'var(--cyan)' }}>
+            <div className="flex items-center gap-1.5 text-xs px-2 py-1 rounded-full"
+              style={{ background: 'rgba(0,229,255,0.08)', border: '1px solid rgba(0,229,255,0.25)', color: 'var(--cyan)' }}>
               <Cpu size={10} />
-              <span>Awaiting repo URL</span>
+              Waiting for repo URL
             </div>
           )}
           <div className="flex items-center gap-2">
@@ -47,7 +47,7 @@ export function ChatPage() {
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
+      <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
         {messages.map(msg => (
           <ChatMessage key={msg.id} msg={msg} />
         ))}
@@ -55,11 +55,8 @@ export function ChatPage() {
         <div ref={bottomRef} />
       </div>
 
-      {/* Pending deploy context banner */}
-      <PendingDeployBanner pendingDeploy={pendingDeploy} />
-
-      {/* Input */}
-      <ChatInput onSend={sendMessage} loading={loading} pendingDeploy={pendingDeploy} />
+      <PendingDeployBanner app={pendingDeploy?.app_name || pendingDeploy} />
+      <ChatInput onSend={sendMessage} loading={loading} pendingDeploy={pendingDeploy?.app_name || pendingDeploy} />
     </div>
   )
 }

@@ -1,86 +1,115 @@
 """
-LLM Service — Groq (llama3-70b) → Gemini → Rule-based fallback
-No OpenAI dependency. All free-tier providers.
+LLM Service — Groq (llama3-70b-8192) → Gemini → minimal structural fallback.
+
+Key rules:
+- Every response goes through the LLM if a key is configured.
+- Rule-based fallback is ONLY for when no LLM is configured at all.
+- Conversation history (last 10 turns) is always passed for context.
+- JSON is enforced via response_format so parsing never fails silently.
 """
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "").strip()
 GROQ_MODEL     = "llama3-70b-8192"
 GEMINI_MODEL   = "gemini-1.5-flash"
 
-# ── System prompt for the DevOps Copilot ─────────────────────────────────────
-SYSTEM_PROMPT = """You are an expert AI DevOps Copilot. You behave like GitHub Copilot for infrastructure.
+# ── System prompt ─────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are a senior DevOps engineer and AI assistant helping users \
+deploy and debug applications on Google Cloud Platform.
 
-CORE BEHAVIOUR RULES:
-1. When a user asks to "deploy" something and hasn't provided a GitHub repo URL, ask for it conversationally.
-2. When they provide a repo, acknowledge and confirm what you will do next.
-3. Always be specific about what is missing before taking action.
-4. Detect intent precisely from natural language.
+PERSONALITY:
+- Conversational, helpful, and precise — like a knowledgeable colleague.
+- Ask follow-up questions naturally when information is missing.
+- Never show a static list of capabilities unless explicitly asked.
+- Answer general questions (e.g. "What is Docker?") directly and helpfully.
 
-INTENT TYPES (always return one of these):
-- deploy_request   → user wants to deploy but hasn't given repo yet → ask for it
-- deploy_with_repo → user provided a GitHub URL → proceed with deployment
-- rollback         → user wants to rollback an app
-- status           → user wants system/service health
-- logs             → user wants to see logs
-- incident         → user asking about alerts/incidents
-- root_cause       → user asking why something failed
-- fix              → user wants auto-remediation
-- general          → anything else
+DEPLOYMENT FLOW:
+- If user wants to deploy but hasn't given a GitHub URL, ask for it naturally.
+- Once you have a GitHub URL, confirm the plan and proceed.
+- If deployment fails, explain the exact error clearly.
 
-CONVERSATIONAL EXAMPLES:
-User: "deploy myapp"
-→ intent: deploy_request, ask for GitHub repo URL
+INTENT TYPES (pick the best fit):
+  deploy_request   — wants to deploy, no repo URL yet
+  deploy_with_repo — has provided a GitHub URL
+  rollback         — wants to revert an app to previous version
+  status           — asking about system or service health
+  logs             — wants recent logs or error traces
+  incident         — asking about active incidents or alerts
+  root_cause       — asking why something failed (RCA)
+  fix              — wants auto-remediation applied
+  general          — anything else (questions, greetings, explanations)
 
-User: "deploy https://github.com/user/myapp"
-→ intent: deploy_with_repo, extract repo_url
-
-User: "here's the repo: https://github.com/acme/api"
-→ intent: deploy_with_repo, extract repo_url
-
-ALWAYS respond in this exact JSON format:
+RESPONSE FORMAT — always return valid JSON:
 {
-  "intent": "<one of the intent types above>",
-  "summary": "<one line of what you understood>",
-  "response": "<your markdown response to the user — be conversational and helpful>",
-  "app_name": "<extracted app name or null>",
-  "repo_url": "<full GitHub URL if provided, else null>",
-  "version": "<version tag if mentioned, else null>",
-  "needs_input": true/false,
-  "missing_fields": ["<list of what is still needed, e.g. repo_url>"]
-}"""
+  "intent":         "<intent type>",
+  "summary":        "<one-line description of what you understood>",
+  "response":       "<your natural language reply in Markdown>",
+  "app_name":       "<extracted app/service name, or null>",
+  "repo_url":       "<full GitHub URL if user provided one, else null>",
+  "version":        "<version tag if mentioned, else null>",
+  "needs_input":    <true if you asked a follow-up question, else false>,
+  "missing_fields": ["<any fields still needed, e.g. repo_url>"]
+}
+
+EXAMPLES:
+
+User: "deploy my app"
+→ {"intent":"deploy_request","response":"Sure! What's the GitHub URL of the repository you'd like to deploy?","needs_input":true,"missing_fields":["repo_url"],...}
+
+User: "https://github.com/acme/api"
+→ {"intent":"deploy_with_repo","response":"Got it — deploying **api** from `https://github.com/acme/api`. I'll clone the repo, validate the Dockerfile, build the image, and deploy to Cloud Run. Starting now...","repo_url":"https://github.com/acme/api","needs_input":false,...}
+
+User: "What is a Dockerfile?"
+→ {"intent":"general","response":"A Dockerfile is a text file containing instructions to build a Docker image...","needs_input":false,...}
+
+User: "why did my last deploy fail?"
+→ {"intent":"root_cause","response":"Let me check the recent deployment logs and error traces...","needs_input":false,...}
+"""
 
 
 async def call_llm(message: str, history: List[Dict[str, str]] = []) -> Dict[str, Any]:
-    """Try Groq → Gemini → rule-based fallback."""
+    """
+    Primary entry point. Tries Groq → Gemini → structural fallback.
+    Always returns a dict with the required keys.
+    """
+    if not GROQ_API_KEY and not GEMINI_API_KEY:
+        logger.error("No LLM configured — GROQ_API_KEY and GEMINI_API_KEY are both unset")
+        return _no_llm_response()
+
     if GROQ_API_KEY:
         result = await _call_groq(message, history)
         if result:
             return result
+        logger.error("Groq failed — trying Gemini")
 
     if GEMINI_API_KEY:
         result = await _call_gemini(message, history)
         if result:
             return result
+        logger.error("Gemini also failed")
 
-    logger.warning("No LLM available — using rule-based fallback")
-    return _rule_based(message)
+    # Both LLMs failed — return an honest error, not fake success
+    return _llm_error_response()
 
 
-# ── Groq ─────────────────────────────────────────────────────────────────────
+# ── Groq ──────────────────────────────────────────────────────────────────────
 
 async def _call_groq(message: str, history: List[Dict]) -> Optional[Dict]:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for h in history[-8:]:
-        messages.append({"role": h["role"], "content": h["content"]})
+    for turn in history[-10:]:
+        role = turn.get("role", "user")
+        if role in ("user", "assistant"):
+            messages.append({"role": role, "content": turn["content"]})
     messages.append({"role": "user", "content": message})
 
     try:
@@ -94,35 +123,37 @@ async def _call_groq(message: str, history: List[Dict]) -> Optional[Dict]:
                 json={
                     "model": GROQ_MODEL,
                     "messages": messages,
-                    "temperature": 0.2,
+                    "temperature": 0.4,
                     "max_tokens": 1024,
                     "response_format": {"type": "json_object"},
                 },
             )
             resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            logger.info(f"Groq response: intent={parsed.get('intent')}")
+            raw = resp.json()["choices"][0]["message"]["content"]
+            parsed = json.loads(raw)
+            parsed = _normalize(parsed)
+            logger.info("Groq OK: intent=%s", parsed.get("intent"))
             return parsed
-    except Exception as e:
-        logger.warning(f"Groq failed: {e}")
-        return None
+    except httpx.HTTPStatusError as exc:
+        logger.error("Groq HTTP %s: %s", exc.response.status_code, exc.response.text[:300])
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Groq error: %s", exc)
+    return None
 
 
-# ── Gemini ───────────────────────────────────────────────────────────────────
+# ── Gemini ─────────────────────────────────────────────────────────────────────
 
 async def _call_gemini(message: str, history: List[Dict]) -> Optional[Dict]:
-    # Build conversation for Gemini
-    history_text = ""
-    for h in history[-6:]:
-        role = "User" if h["role"] == "user" else "Assistant"
-        history_text += f"{role}: {h['content']}\n"
+    turns = ""
+    for turn in history[-8:]:
+        role = "User" if turn.get("role") == "user" else "Assistant"
+        turns += f"{role}: {turn['content']}\n"
 
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
-        f"{history_text}"
+        f"{turns}"
         f"User: {message}\n\n"
-        "Respond ONLY with valid JSON matching the schema above."
+        "Respond ONLY with a JSON object. No markdown fences."
     )
 
     try:
@@ -133,7 +164,7 @@ async def _call_gemini(message: str, history: List[Dict]) -> Optional[Dict]:
                 json={
                     "contents": [{"parts": [{"text": prompt}]}],
                     "generationConfig": {
-                        "temperature": 0.2,
+                        "temperature": 0.4,
                         "maxOutputTokens": 1024,
                         "responseMimeType": "application/json",
                     },
@@ -142,144 +173,76 @@ async def _call_gemini(message: str, history: List[Dict]) -> Optional[Dict]:
             resp.raise_for_status()
             data = resp.json()
             raw = data["candidates"][0]["content"]["parts"][0]["text"]
-            # Strip possible markdown fences
             raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-            parsed = json.loads(raw)
-            logger.info(f"Gemini response: intent={parsed.get('intent')}")
+            parsed = _normalize(json.loads(raw))
+            logger.info("Gemini OK: intent=%s", parsed.get("intent"))
             return parsed
-    except Exception as e:
-        logger.warning(f"Gemini failed: {e}")
-        return None
+    except httpx.HTTPStatusError as exc:
+        logger.error("Gemini HTTP %s: %s", exc.response.status_code, exc.response.text[:300])
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Gemini error: %s", exc)
+    return None
 
 
-# ── Rule-based fallback ───────────────────────────────────────────────────────
+# ── Response builders ──────────────────────────────────────────────────────────
 
-def _rule_based(message: str) -> Dict[str, Any]:
-    msg = message.lower().strip()
-    repo_url = _extract_github_url(message)
-
-    # Priority: RCA before deploy (avoid substring conflicts)
-    if any(w in msg for w in ["why did", "why is", "root cause", "rca", "reason", "investigate"]):
-        return _resp("root_cause", "Root cause analysis requested",
-            "## \U0001f50d Root Cause Analysis\n\nAnalyzing failure signals...\n\n"
-            "1. **Log correlation** — matching error spikes with deploys\n"
-            "2. **Metric diff** — comparing before/after\n"
-            "3. **Change audit** — what changed recently?\n\nReport incoming...")
-
-    if any(w in msg for w in ["rollback", "revert", "undo"]):
-        app = _extract_app(msg)
-        return _resp("rollback", f"Rolling back {app}",
-            f"## \u23ea Rollback\n\nRolling **{app}** back to last stable version...",
-            app_name=app)
-
-    if repo_url or ("deploy" in msg and ("http" in msg or "github" in msg)):
-        app = _extract_app(msg) or _app_from_url(repo_url)
-        return {
-            "intent": "deploy_with_repo",
-            "summary": f"Deploying from {repo_url}",
-            "response": (
-                f"## \U0001f680 Deployment Starting\n\n"
-                f"Got it! I'll deploy from:\n`{repo_url}`\n\n"
-                "**Running:**\n"
-                "1. \U0001f4e5 Clone repository\n"
-                "2. \u2705 Validate Dockerfile\n"
-                "3. \U0001f40b Build Docker image\n"
-                "4. \u2601\ufe0f Push to Artifact Registry\n"
-                "5. \U0001f680 Deploy to Cloud Run\n\nStarting now..."
-            ),
-            "app_name": app,
-            "repo_url": repo_url,
-            "version": _extract_version(msg),
-            "needs_input": False,
-            "missing_fields": [],
-        }
-
-    if "deploy" in msg or "release" in msg or "ship" in msg:
-        app = _extract_app(msg)
-        return {
-            "intent": "deploy_request",
-            "summary": "Deploy requested — need GitHub repo",
-            "response": (
-                f"## \U0001f680 Let's Deploy Your App!\n\n"
-                f"I can deploy **{app or 'your application'}** to Google Cloud Run.\n\n"
-                "To get started, I need:\n\n"
-                "1. \U0001f517 **GitHub repository URL** — e.g. `https://github.com/you/myapp`\n"
-                "2. \U0001f433 A **Dockerfile** must exist in the repo root\n\n"
-                "Please share the GitHub repo URL and I'll handle the rest!"
-            ),
-            "app_name": app,
-            "repo_url": None,
-            "version": None,
-            "needs_input": True,
-            "missing_fields": ["repo_url"],
-        }
-
-    if any(w in msg for w in ["log", "logs", "error", "show me", "what happened"]):
-        return _resp("logs", "Fetching logs", "## \U0001f4cb Logs\n\nFetching recent log entries and scanning for errors...")
-
-    if any(w in msg for w in ["incident", "alert", "outage", "down", "degraded", "active"]):
-        return _resp("incident", "Checking incidents", "## \U0001f6a8 Incident Scan\n\nChecking all services for active incidents...")
-
-    if any(w in msg for w in ["fix", "repair", "remediate", "auto"]):
-        return _resp("fix", "Auto-remediation", "## \U0001f527 Auto-Fix\n\nAnalyzing issues and generating remediation plan...")
-
-    if any(w in msg for w in ["status", "health", "how is", "metrics", "uptime", "overview"]):
-        return _resp("status", "System health check", "## \U0001f4ca System Status\n\nFetching real-time health metrics...")
-
+def _no_llm_response() -> Dict[str, Any]:
+    missing = []
+    if not GROQ_API_KEY:
+        missing.append("`GROQ_API_KEY`")
+    if not GEMINI_API_KEY:
+        missing.append("`GEMINI_API_KEY`")
     return {
         "intent": "general",
-        "summary": "General inquiry",
+        "summary": "LLM not configured",
         "response": (
-            "## \U0001f916 AI DevOps Copilot\n\n"
-            "I'm your DevOps assistant. Here's what I can do:\n\n"
-            "- \U0001f680 **Deploy** — `deploy https://github.com/you/myapp`\n"
-            "- \u23ea **Rollback** — `rollback payment-service`\n"
-            "- \U0001f50d **RCA** — `why did the last deploy fail?`\n"
-            "- \U0001f6a8 **Incidents** — `any active alerts?`\n"
-            "- \U0001f527 **Auto-fix** — `fix the payment service`\n"
-            "- \U0001f4ca **Health** — `system health check`\n\n"
-            "What would you like to do?"
+            f"⚠️ **LLM not configured.**\n\n"
+            f"I need at least one API key to respond intelligently. "
+            f"Please add {' or '.join(missing)} to your `.env` file and restart the server.\n\n"
+            "**Free keys:**\n"
+            "- Groq (recommended): https://console.groq.com\n"
+            "- Gemini: https://aistudio.google.com"
         ),
-        "app_name": None,
-        "repo_url": None,
-        "version": None,
-        "needs_input": False,
-        "missing_fields": [],
-    }
-
-
-def _resp(intent: str, summary: str, response: str, app_name=None) -> Dict:
-    return {
-        "intent": intent, "summary": summary, "response": response,
-        "app_name": app_name, "repo_url": None, "version": None,
+        "app_name": None, "repo_url": None, "version": None,
         "needs_input": False, "missing_fields": [],
     }
 
 
-def _extract_github_url(text: str) -> Optional[str]:
-    import re
-    m = re.search(r'https?://github\.com/[^\s"\'<>]+', text)
+def _llm_error_response() -> Dict[str, Any]:
+    return {
+        "intent": "general",
+        "summary": "LLM temporarily unavailable",
+        "response": (
+            "⚠️ **I'm having trouble reaching the AI backend right now.**\n\n"
+            "Both Groq and Gemini returned errors. This is usually a temporary issue. "
+            "Please try again in a few seconds.\n\n"
+            "If this persists, check your API keys are valid and have quota remaining."
+        ),
+        "app_name": None, "repo_url": None, "version": None,
+        "needs_input": False, "missing_fields": [],
+    }
+
+
+def _normalize(data: Dict) -> Dict:
+    """Ensure all expected keys exist with sensible defaults."""
+    data.setdefault("intent", "general")
+    data.setdefault("summary", "")
+    data.setdefault("response", "")
+    data.setdefault("app_name", None)
+    data.setdefault("repo_url", None)
+    data.setdefault("version", None)
+    data.setdefault("needs_input", False)
+    data.setdefault("missing_fields", [])
+
+    # Validate and extract repo URL if LLM missed it
+    if not data["repo_url"]:
+        data["repo_url"] = extract_github_url(data.get("response", ""))
+
+    return data
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def extract_github_url(text: str) -> Optional[str]:
+    m = re.search(r"https?://github\.com/[^\s\"'<>)\]]+", text)
     return m.group(0).rstrip("/.,)") if m else None
-
-
-def _extract_app(msg: str) -> Optional[str]:
-    import re
-    known = ["payment-service", "auth-service", "api-gateway", "frontend", "backend", "myapp"]
-    for app in known:
-        if app in msg:
-            return app
-    # Try word after deploy/rollback/fix keyword
-    m = re.search(r'\b(?:deploy|rollback|fix|restart)\s+([\w-]+)', msg)
-    return m.group(1) if m else None
-
-
-def _app_from_url(url: Optional[str]) -> Optional[str]:
-    if not url:
-        return None
-    return url.rstrip("/").split("/")[-1].replace(".git", "")
-
-
-def _extract_version(msg: str) -> Optional[str]:
-    import re
-    m = re.search(r'v?\d+\.\d+(\.\d+)?', msg)
-    return m.group(0) if m else "latest"
