@@ -1,17 +1,24 @@
 """
-LLM Service — Groq (llama3-70b-8192) → Gemini → minimal structural fallback.
+LLM Service — Groq → Gemini → honest error.
 
-Key rules:
-- Every response goes through the LLM if a key is configured.
-- Rule-based fallback is ONLY for when no LLM is configured at all.
-- Conversation history (last 10 turns) is always passed for context.
-- JSON is enforced via response_format so parsing never fails silently.
+FIXED:
+- Model changed from llama3-70b-8192 → llama-3.3-70b-versatile (current Groq model)
+- Added explicit dotenv load in case module is imported before main.py runs
+- Added model fallback list so if one model is deprecated, next one is tried
+- Better error logging showing exact HTTP status and message from Groq
 """
 import json
 import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
+
+# Ensure .env is loaded even if this module is imported standalone (e.g. tests)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import httpx
 
@@ -20,8 +27,18 @@ logger = logging.getLogger(__name__)
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "").strip()
-GROQ_MODEL     = "llama3-70b-8192"
-GEMINI_MODEL   = "gemini-1.5-flash"
+
+# ── Groq model priority list ──────────────────────────────────────────────────
+# Try models in order; first one that works wins.
+# llama-3.3-70b-versatile is the current recommended model on Groq playground.
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",     # Current — matches Groq playground
+    "llama3-70b-8192",             # Older alias (may still work)
+    "llama-3.1-70b-versatile",     # Previous version
+    "llama3-8b-8192",              # Fallback to smaller model
+]
+
+GEMINI_MODEL = "gemini-1.5-flash"
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a senior DevOps engineer and AI assistant helping users \
@@ -57,93 +74,106 @@ RESPONSE FORMAT — always return valid JSON:
   "app_name":       "<extracted app/service name, or null>",
   "repo_url":       "<full GitHub URL if user provided one, else null>",
   "version":        "<version tag if mentioned, else null>",
-  "needs_input":    <true if you asked a follow-up question, else false>,
-  "missing_fields": ["<any fields still needed, e.g. repo_url>"]
-}
-
-EXAMPLES:
-
-User: "deploy my app"
-→ {"intent":"deploy_request","response":"Sure! What's the GitHub URL of the repository you'd like to deploy?","needs_input":true,"missing_fields":["repo_url"],...}
-
-User: "https://github.com/acme/api"
-→ {"intent":"deploy_with_repo","response":"Got it — deploying **api** from `https://github.com/acme/api`. I'll clone the repo, validate the Dockerfile, build the image, and deploy to Cloud Run. Starting now...","repo_url":"https://github.com/acme/api","needs_input":false,...}
-
-User: "What is a Dockerfile?"
-→ {"intent":"general","response":"A Dockerfile is a text file containing instructions to build a Docker image...","needs_input":false,...}
-
-User: "why did my last deploy fail?"
-→ {"intent":"root_cause","response":"Let me check the recent deployment logs and error traces...","needs_input":false,...}
-"""
+  "needs_input":    <true if you need more info from the user, else false>,
+  "missing_fields": ["<any fields still needed>"]
+}"""
 
 
 async def call_llm(message: str, history: List[Dict[str, str]] = []) -> Dict[str, Any]:
-    """
-    Primary entry point. Tries Groq → Gemini → structural fallback.
-    Always returns a dict with the required keys.
-    """
-    if not GROQ_API_KEY and not GEMINI_API_KEY:
-        logger.error("No LLM configured — GROQ_API_KEY and GEMINI_API_KEY are both unset")
+    """Try Groq → Gemini → honest error message. Never silently fails."""
+
+    # Reload keys in case .env was updated after import
+    groq_key   = os.getenv("GROQ_API_KEY", "").strip()
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+    if not groq_key and not gemini_key:
+        logger.error("No LLM API key configured (GROQ_API_KEY and GEMINI_API_KEY are both empty)")
         return _no_llm_response()
 
-    if GROQ_API_KEY:
-        result = await _call_groq(message, history)
+    if groq_key:
+        result = await _call_groq(message, history, groq_key)
         if result:
             return result
-        logger.error("Groq failed — trying Gemini")
+        logger.error("All Groq models failed — trying Gemini next")
 
-    if GEMINI_API_KEY:
-        result = await _call_gemini(message, history)
+    if gemini_key:
+        result = await _call_gemini(message, history, gemini_key)
         if result:
             return result
         logger.error("Gemini also failed")
 
-    # Both LLMs failed — return an honest error, not fake success
     return _llm_error_response()
 
 
 # ── Groq ──────────────────────────────────────────────────────────────────────
 
-async def _call_groq(message: str, history: List[Dict]) -> Optional[Dict]:
+async def _call_groq(message: str, history: List[Dict], api_key: str) -> Optional[Dict]:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for turn in history[-10:]:
         role = turn.get("role", "user")
         if role in ("user", "assistant"):
-            messages.append({"role": role, "content": turn["content"]})
+            messages.append({"role": role, "content": str(turn["content"])})
     messages.append({"role": "user", "content": message})
 
+    # Try each model in priority order
+    for model in GROQ_MODELS:
+        result = await _groq_request(messages, model, api_key)
+        if result is not None:
+            logger.info("✅ Groq success: model=%s intent=%s", model, result.get("intent"))
+            return result
+
+    return None
+
+
+async def _groq_request(messages: List[Dict], model: str, api_key: str) -> Optional[Dict]:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": GROQ_MODEL,
+                    "model": model,
                     "messages": messages,
                     "temperature": 0.4,
                     "max_tokens": 1024,
                     "response_format": {"type": "json_object"},
                 },
             )
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(raw)
-            parsed = _normalize(parsed)
-            logger.info("Groq OK: intent=%s", parsed.get("intent"))
-            return parsed
-    except httpx.HTTPStatusError as exc:
-        logger.error("Groq HTTP %s: %s", exc.response.status_code, exc.response.text[:300])
+
+            if resp.status_code == 404:
+                logger.warning("Groq model not found: %s — trying next", model)
+                return None
+
+            if resp.status_code == 429:
+                logger.error("Groq rate limit hit for model %s", model)
+                return None
+
+            if resp.status_code != 200:
+                logger.error("Groq HTTP %s for model %s: %s",
+                             resp.status_code, model, resp.text[:300])
+                return None
+
+            raw     = resp.json()["choices"][0]["message"]["content"]
+            parsed  = json.loads(raw)
+            return _normalize(parsed)
+
+    except json.JSONDecodeError as exc:
+        logger.error("Groq returned invalid JSON for model %s: %s", model, exc)
+        return None
+    except httpx.ConnectError:
+        logger.error("Cannot connect to Groq API — check network")
+        return None
     except Exception as exc:  # noqa: BLE001
-        logger.error("Groq error: %s", exc)
-    return None
+        logger.error("Groq unexpected error (model=%s): %s", model, exc)
+        return None
 
 
 # ── Gemini ─────────────────────────────────────────────────────────────────────
 
-async def _call_gemini(message: str, history: List[Dict]) -> Optional[Dict]:
+async def _call_gemini(message: str, history: List[Dict], api_key: str) -> Optional[Dict]:
     turns = ""
     for turn in history[-8:]:
         role = "User" if turn.get("role") == "user" else "Assistant"
@@ -153,14 +183,14 @@ async def _call_gemini(message: str, history: List[Dict]) -> Optional[Dict]:
         f"{SYSTEM_PROMPT}\n\n"
         f"{turns}"
         f"User: {message}\n\n"
-        "Respond ONLY with a JSON object. No markdown fences."
+        "Respond ONLY with a JSON object matching the schema above. No markdown fences."
     )
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-                params={"key": GEMINI_API_KEY},
+                params={"key": api_key},
                 json={
                     "contents": [{"parts": [{"text": prompt}]}],
                     "generationConfig": {
@@ -170,38 +200,40 @@ async def _call_gemini(message: str, history: List[Dict]) -> Optional[Dict]:
                     },
                 },
             )
-            resp.raise_for_status()
+
+            if resp.status_code != 200:
+                logger.error("Gemini HTTP %s: %s", resp.status_code, resp.text[:300])
+                return None
+
             data = resp.json()
-            raw = data["candidates"][0]["content"]["parts"][0]["text"]
-            raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-            parsed = _normalize(json.loads(raw))
-            logger.info("Gemini OK: intent=%s", parsed.get("intent"))
-            return parsed
-    except httpx.HTTPStatusError as exc:
-        logger.error("Gemini HTTP %s: %s", exc.response.status_code, exc.response.text[:300])
+            raw  = data["candidates"][0]["content"]["parts"][0]["text"]
+            raw  = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+            return _normalize(json.loads(raw))
+
+    except json.JSONDecodeError as exc:
+        logger.error("Gemini returned invalid JSON: %s", exc)
+        return None
     except Exception as exc:  # noqa: BLE001
         logger.error("Gemini error: %s", exc)
-    return None
+        return None
 
 
 # ── Response builders ──────────────────────────────────────────────────────────
 
 def _no_llm_response() -> Dict[str, Any]:
-    missing = []
-    if not GROQ_API_KEY:
-        missing.append("`GROQ_API_KEY`")
-    if not GEMINI_API_KEY:
-        missing.append("`GEMINI_API_KEY`")
     return {
-        "intent": "general",
-        "summary": "LLM not configured",
+        "intent":   "general",
+        "summary":  "LLM not configured",
         "response": (
-            f"⚠️ **LLM not configured.**\n\n"
-            f"I need at least one API key to respond intelligently. "
-            f"Please add {' or '.join(missing)} to your `.env` file and restart the server.\n\n"
-            "**Free keys:**\n"
-            "- Groq (recommended): https://console.groq.com\n"
-            "- Gemini: https://aistudio.google.com"
+            "⚠️ **LLM not configured.**\n\n"
+            "I need an API key to respond intelligently.\n\n"
+            "**Quick fix:**\n"
+            "1. Get a free key at https://console.groq.com\n"
+            "2. Add it to `backend/.env`:\n"
+            "   ```\n"
+            "   GROQ_API_KEY=gsk_...\n"
+            "   ```\n"
+            "3. Restart the server: `uvicorn main:app --reload`"
         ),
         "app_name": None, "repo_url": None, "version": None,
         "needs_input": False, "missing_fields": [],
@@ -210,13 +242,19 @@ def _no_llm_response() -> Dict[str, Any]:
 
 def _llm_error_response() -> Dict[str, Any]:
     return {
-        "intent": "general",
-        "summary": "LLM temporarily unavailable",
+        "intent":   "general",
+        "summary":  "LLM temporarily unavailable",
         "response": (
-            "⚠️ **I'm having trouble reaching the AI backend right now.**\n\n"
-            "Both Groq and Gemini returned errors. This is usually a temporary issue. "
-            "Please try again in a few seconds.\n\n"
-            "If this persists, check your API keys are valid and have quota remaining."
+            "⚠️ **AI backend temporarily unavailable.**\n\n"
+            "Both Groq and Gemini returned errors. "
+            "Check the backend logs for details:\n"
+            "```bash\n"
+            "uvicorn main:app --reload  # watch the terminal output\n"
+            "```\n\n"
+            "Common causes:\n"
+            "- Invalid or expired API key\n"
+            "- Rate limit exceeded\n"
+            "- Network connectivity issue"
         ),
         "app_name": None, "repo_url": None, "version": None,
         "needs_input": False, "missing_fields": [],
@@ -224,25 +262,22 @@ def _llm_error_response() -> Dict[str, Any]:
 
 
 def _normalize(data: Dict) -> Dict:
-    """Ensure all expected keys exist with sensible defaults."""
-    data.setdefault("intent", "general")
-    data.setdefault("summary", "")
-    data.setdefault("response", "")
-    data.setdefault("app_name", None)
-    data.setdefault("repo_url", None)
-    data.setdefault("version", None)
-    data.setdefault("needs_input", False)
+    data.setdefault("intent",        "general")
+    data.setdefault("summary",       "")
+    data.setdefault("response",      "")
+    data.setdefault("app_name",      None)
+    data.setdefault("repo_url",      None)
+    data.setdefault("version",       None)
+    data.setdefault("needs_input",   False)
     data.setdefault("missing_fields", [])
 
-    # Validate and extract repo URL if LLM missed it
+    # Extract repo URL from response text if LLM forgot to put it in the field
     if not data["repo_url"]:
         data["repo_url"] = extract_github_url(data.get("response", ""))
 
     return data
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
 def extract_github_url(text: str) -> Optional[str]:
-    m = re.search(r"https?://github\.com/[^\s\"'<>)\]]+", text)
+    m = re.search(r"https?://github\.com/[^\s\"'<>)\]]+", text or "")
     return m.group(0).rstrip("/.,)") if m else None
