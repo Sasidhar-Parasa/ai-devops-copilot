@@ -26,4 +26,4 @@ class IncidentAgent:
             "high_count":    len(high),
             "recent_errors": errors[:3],
         }
-        
+

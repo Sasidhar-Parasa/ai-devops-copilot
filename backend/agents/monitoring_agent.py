@@ -71,4 +71,4 @@ class MonitoringAgent:
             "success_rate":    round(random.uniform(85, 99), 1),
             "timestamp":       datetime.utcnow().isoformat(),
         }
-        
+
