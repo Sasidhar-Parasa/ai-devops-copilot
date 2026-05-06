@@ -1,21 +1,22 @@
 """
-AI DevOps Copilot - Main FastAPI Application
-.env is loaded HERE, at the very top, before any service module reads os.getenv()
+AI DevOps Copilot — FastAPI entry point.
+dotenv is loaded FIRST so all os.getenv() calls in imported modules
+see the values from backend/.env. The # noqa: E402 comments tell ruff
+that the imports below load_dotenv() are intentionally placed here.
 """
-# ── Load .env first — must happen before any service imports ──────────────────
 from dotenv import load_dotenv
-load_dotenv()  # reads backend/.env into os.environ
+load_dotenv()  # must be before any other local import
 
-import logging
-import os
-from contextlib import asynccontextmanager
+import logging  # noqa: E402
+import os  # noqa: E402
+from contextlib import asynccontextmanager  # noqa: E402
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
-from routers import chat, deployments, logs, health
-from services.database import init_db
-from utils.logger import setup_logger
+from routers import chat, deployments, logs, health  # noqa: E402
+from services.database import init_db  # noqa: E402
+from utils.logger import setup_logger  # noqa: E402
 
 setup_logger()
 logger = logging.getLogger(__name__)
@@ -24,7 +25,6 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 AI DevOps Copilot starting...")
-    # Log which LLM is active so you can debug key issues immediately
     groq_key   = os.getenv("GROQ_API_KEY", "")
     gemini_key = os.getenv("GEMINI_API_KEY", "")
     gcp_proj   = os.getenv("GCP_PROJECT_ID", "")
@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
     elif gemini_key:
         logger.info("✅ Gemini API key loaded (%s...)", gemini_key[:8])
     else:
-        logger.warning("⚠️  No LLM API key found — add GROQ_API_KEY to backend/.env")
+        logger.warning("⚠️  No LLM API key — add GROQ_API_KEY to backend/.env")
 
     if gcp_proj:
         logger.info("✅ GCP project: %s", gcp_proj)
@@ -71,12 +71,15 @@ app.include_router(health.router,      prefix="/api", tags=["Health"])
 
 @app.get("/")
 async def root():
-    groq_configured   = bool(os.getenv("GROQ_API_KEY"))
-    gemini_configured = bool(os.getenv("GEMINI_API_KEY"))
     return {
         "service": "AI DevOps Copilot",
         "version": "1.0.0",
         "status":  "operational",
-        "llm":     "groq" if groq_configured else ("gemini" if gemini_configured else "not-configured"),
-        "agents":  ["coordinator", "deployment", "monitoring", "incident", "root_cause", "fix"],
+        "llm": (
+            "groq"   if os.getenv("GROQ_API_KEY")   else
+            "gemini" if os.getenv("GEMINI_API_KEY")  else
+            "not-configured"
+        ),
+        "agents": ["coordinator", "deployment", "monitoring",
+                   "incident", "root_cause", "fix"],
     }
