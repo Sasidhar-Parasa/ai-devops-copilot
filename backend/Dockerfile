@@ -1,10 +1,11 @@
-# ═══════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
 #  AI DevOps Copilot — Backend Dockerfile
-#  Installs gcloud CLI so Cloud Run can trigger deployments.
-#  Auth is via the Cloud Run Service Account (no key file needed).
-# ═══════════════════════════════════════════════════════════════════════
+#  Fixes:
+#  - gcloud config dir permission denied (appuser needs writable home)
+#  - gcloud installed system-wide, config dir set via env var
+# ════════════════════════════════════════════════════════════════
 
-# ── Stage 1: Builder ──────────────────────────────────────────────────
+# ── Stage 1: Builder ─────────────────────────────────────────────
 FROM python:3.11-slim AS builder
 
 WORKDIR /build
@@ -14,39 +15,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc git \
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-# ── Stage 2: Runtime ──────────────────────────────────────────────────
+# ── Stage 2: Runtime ─────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# Install: curl + git (for cloning) + gcloud CLI
+# Install curl, git, gcloud CLI
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl \
-        git \
-        gnupg \
-        apt-transport-https \
-        ca-certificates \
+        curl git gnupg apt-transport-https ca-certificates \
     && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] \
         https://packages.cloud.google.com/apt cloud-sdk main" \
-        | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list \
+        | tee /etc/apt/sources.list.d/google-cloud-sdk.list \
     && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
         | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
-    && apt-get update && apt-get install -y --no-install-recommends \
-        google-cloud-cli \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get update && apt-get install -y --no-install-recommends google-cloud-cli \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Copy installed Python packages
+# Copy Python packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy app source
+# Copy app
 COPY . .
 
-RUN mkdir -p /app/data
+# Create a writable home for appuser + gcloud config dir
+RUN useradd -m -u 1000 -s /bin/bash appuser \
+    && mkdir -p /home/appuser/.config/gcloud/logs \
+    && mkdir -p /app/data \
+    && chown -R appuser:appuser /home/appuser /app
 
-# Non-root user
-RUN groupadd -r appgroup && useradd -r -g appgroup -s /bin/false appuser \
-    && chown -R appuser:appgroup /app
+# Tell gcloud to use /home/appuser as config root
+ENV HOME=/home/appuser
+ENV CLOUDSDK_CONFIG=/home/appuser/.config/gcloud
 
 USER appuser
 
