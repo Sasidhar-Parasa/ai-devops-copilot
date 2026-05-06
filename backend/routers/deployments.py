@@ -3,8 +3,8 @@ Deployments Router — Real + simulated deployments
 """
 import json
 import logging
-from typing import Optional
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+# from typing import Optional
+from fastapi import APIRouter, HTTPException, Query
 from models.schemas import DeployRequest, RollbackRequest
 from services.database import get_deployments
 

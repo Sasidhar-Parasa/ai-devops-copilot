@@ -209,3 +209,4 @@ class DeploymentAgent:
             "status": "rolled_back",
             "stages": stages,
         }
+        

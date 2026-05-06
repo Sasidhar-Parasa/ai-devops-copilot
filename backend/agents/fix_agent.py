@@ -85,3 +85,4 @@ class FixAgent:
         }
 
         return fixes.get(severity, fixes["medium"])
+        
