@@ -29,8 +29,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -45,17 +44,14 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-asyncio httpx ruff
 
-      # Lint runs as informational only — exit code is ALWAYS 0
-      # Annotations still show in GitHub UI but the job never fails here
-      - name: Lint (informational)
+      # ── Lint runs as a WARNING only — never blocks the pipeline ──
+      # continue-on-error: true means even if ruff exits 1, the job
+      # continues to the test step and the overall job still passes.
+      - name: Lint (warnings only)
         working-directory: backend
         continue-on-error: true
         run: |
-          ruff check . \
-            --select=E,F,W \
-            --ignore=E501 \
-            --output-format=github
-          exit 0
+          ruff check . --select=E,F,W --ignore=E501,E402 --output-format=github
 
       - name: Run tests
         working-directory: backend
@@ -75,7 +71,7 @@ jobs:
           retention-days: 7
 
   # ════════════════════════════════════════════════════════════════
-  # JOB 2 — Build & Deploy Backend
+  # JOB 2 — Deploy Backend
   # ════════════════════════════════════════════════════════════════
   deploy-backend:
     name: 🚀 Deploy Backend
@@ -89,8 +85,7 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -105,8 +100,7 @@ jobs:
       - name: Configure Docker auth
         run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Build & push backend image
         uses: docker/build-push-action@v5
@@ -141,20 +135,18 @@ jobs:
             GCP_REGION=${{ env.GCP_REGION }}
           secrets: GROQ_API_KEY=groq-api-key:latest
 
-      - name: Smoke test backend
+      - name: Smoke test
         run: |
           URL="${{ steps.deploy.outputs.url }}"
-          echo "Testing $URL/api/ping"
           HTTP=000
           for i in $(seq 1 12); do
             HTTP=$(curl -sf -o /dev/null -w "%{http_code}" "$URL/api/ping" || echo 000)
             [ "$HTTP" = "200" ] && { echo "✅ Backend healthy"; curl -s "$URL/api/ping"; break; }
-            echo "⏳ Attempt $i/12 (HTTP $HTTP) — waiting 5s..."
-            sleep 5
+            echo "⏳ $i/12 (HTTP $HTTP)"; sleep 5
           done
-          [ "$HTTP" = "200" ] || { echo "❌ Smoke test failed after 60s"; exit 1; }
+          [ "$HTTP" = "200" ] || { echo "❌ Smoke test failed"; exit 1; }
 
-      - name: Job summary
+      - name: Summary
         run: |
           {
             echo "## 🚀 Backend Deployed"
@@ -165,7 +157,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ════════════════════════════════════════════════════════════════
-  # JOB 3 — Build & Deploy Frontend
+  # JOB 3 — Deploy Frontend
   # ════════════════════════════════════════════════════════════════
   deploy-frontend:
     name: 🎨 Deploy Frontend
@@ -177,8 +169,7 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -193,8 +184,7 @@ jobs:
       - name: Configure Docker auth
         run: gcloud auth configure-docker ${{ env.AR_HOST }} --quiet
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Build & push frontend image
         uses: docker/build-push-action@v5
@@ -225,14 +215,14 @@ jobs:
             --max-instances=3
             --port=8080
 
-      - name: Job summary
+      - name: Summary
         run: |
           {
             echo "## 🎉 Deployment Complete!"
             echo ""
             echo "| Service | URL |"
             echo "|---------|-----|"
-            echo "| 🌐 **Frontend (your public URL)** | ${{ steps.deploy.outputs.url }} |"
+            echo "| 🌐 **Frontend** | ${{ steps.deploy.outputs.url }} |"
             echo "| ⚙️ Backend | ${{ needs.deploy-backend.outputs.backend_url }} |"
             echo "| 📖 API Docs | ${{ needs.deploy-backend.outputs.backend_url }}/docs |"
           } >> "$GITHUB_STEP_SUMMARY"
