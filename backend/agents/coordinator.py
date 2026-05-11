@@ -1,6 +1,6 @@
 """
 Coordinator Agent — routes LLM intent to sub-agents.
-Every response goes through the real LLM. No simulated deployments.
+deploy_with_repo returns repo_url in data so frontend can open SSE stream.
 """
 import logging
 import time
@@ -22,12 +22,6 @@ from agents.fix_agent import FixAgent
 
 logger = logging.getLogger(__name__)
 
-try:
-    from services.deploy_service import full_deploy_pipeline
-    REAL_DEPLOY = True
-except ImportError:
-    REAL_DEPLOY = False
-    logger.warning("deploy_service not available")
 
 INTENT_MAP = {
     "deploy_request":   Intent.DEPLOY,
@@ -44,33 +38,33 @@ INTENT_MAP = {
 
 class CoordinatorAgent:
     def __init__(self):
-        self.sim_agent    = DeploymentAgent()
-        self.monitoring   = MonitoringAgent()
-        self.incident     = IncidentAgent()
-        self.root_cause   = RootCauseAgent()
-        self.fix_agent    = FixAgent()
+        self.sim_agent  = DeploymentAgent()
+        self.monitoring = MonitoringAgent()
+        self.incident   = IncidentAgent()
+        self.root_cause = RootCauseAgent()
+        self.fix_agent  = FixAgent()
 
     async def process(self, request: ChatRequest) -> ChatResponse:
         steps: List[AgentStep] = []
         data:  Dict[str, Any]  = {}
         session_id = request.session_id or "default"
-        get_session(session_id)  # ensure session exists
+        get_session(session_id)
 
-        history = [{"role": m.role, "content": m.content} for m in (request.history or [])]
+        history = [{"role": m.role, "content": m.content}
+                   for m in (request.history or [])]
 
-        # ── Check if user is completing a pending deploy (providing repo URL) ─
+        # If user is responding to pending deploy with a URL
         pending     = get_pending_deploy(session_id)
         repo_in_msg = extract_github_url(request.message)
         if pending and repo_in_msg:
-            # User replied with a GitHub URL after we asked — construct context
             request = ChatRequest(
-                message=f"Deploy from {repo_in_msg} (app: {pending.get('app_name', 'myapp')})",
+                message=f"Deploy from {repo_in_msg} (app: {pending.get('app_name', 'app')})",
                 session_id=session_id,
                 history=request.history,
             )
             history.append({"role": "user", "content": request.message})
 
-        # ── LLM call ──────────────────────────────────────────────────────────
+        # LLM call
         t0 = time.monotonic()
         ai = await call_llm(request.message, history)
         intent_str = ai.get("intent", "general")
@@ -84,11 +78,10 @@ class CoordinatorAgent:
             status="success",
         ))
 
-        app_name = ai.get("app_name") or "myapp"
+        app_name = ai.get("app_name") or "app"
         repo_url = ai.get("repo_url")
         version  = ai.get("version") or "latest"
 
-        # ── Route ─────────────────────────────────────────────────────────────
         try:
             if intent_str == "deploy_request" or (intent == Intent.DEPLOY and not repo_url):
                 set_pending_deploy(session_id, app_name, version)
@@ -96,54 +89,43 @@ class CoordinatorAgent:
                     agent=AgentType.DEPLOYMENT,
                     action="Waiting for repository URL",
                     result=f"Stored pending deploy for `{app_name}`",
-                    duration_ms=0,
-                    status="warning",
+                    duration_ms=0, status="warning",
                 ))
                 data["waiting_for"] = "repo_url"
+                data["app_name"]    = app_name
 
             elif intent_str == "deploy_with_repo" or (intent == Intent.DEPLOY and repo_url):
                 clear_deploy_context(session_id)
-                t1 = time.monotonic()
-
-                if REAL_DEPLOY:
-                    dep = await full_deploy_pipeline(repo_url, app_name, version)
-                else:
-                    dep = await self.sim_agent.run(app_name, version)
-
-                status  = dep.get("status", "unknown")
-                svc_url = dep.get("service_url", "")
-                stages  = dep.get("stages", [])
-                val_err = dep.get("validation_errors", [])
-
-                if status == "success":
-                    ai["response"] = (
-                        f"## ✅ Deployment Successful!\n\n"
-                        f"**{app_name}** is live:\n\n"
-                        f"🌐 [{svc_url}]({svc_url})\n\n"
-                        f"**Pipeline:** {len(stages)} stages — "
-                        + ", ".join(f"{s['name']} ({s.get('duration_seconds',0)}s)" for s in stages)
-                    )
-                elif status == "validation_failed":
-                    ai["response"] = (
-                        f"## ❌ Deployment Blocked\n\n"
-                        f"Validation failed for `{repo_url}`:\n\n"
-                        + "\n\n".join(val_err or dep.get("error", ["Unknown validation error"]))
-                    )
-                else:
-                    err = dep.get("error", "Unknown error")
-                    failed = next((s["name"] for s in stages if s["status"] == "failed"), "Unknown")
-                    ai["response"] = (
-                        f"## ❌ Deployment Failed — {failed} stage\n\n{err}"
-                    )
-
-                data["deployment"] = dep
+                # Tell the frontend to start the SSE stream
+                # The actual pipeline runs via /api/deploy/stream
+                data["deployment"] = {
+                    "repo_url":  repo_url,
+                    "app_name":  app_name,
+                    "version":   version,
+                    "status":    "streaming",  # frontend will open SSE
+                }
                 steps.append(AgentStep(
                     agent=AgentType.DEPLOYMENT,
-                    action=f"Pipeline for `{app_name}`",
-                    result=f"Status: **{status}**" + (f" · {svc_url}" if svc_url else ""),
-                    duration_ms=int((time.monotonic() - t1) * 1000),
-                    status="success" if status == "success" else "error",
+                    action=f"Starting deployment pipeline for `{app_name}`",
+                    result=f"SSE stream ready for `{repo_url}`",
+                    duration_ms=0, status="success",
                 ))
+
+                # Update AI response to be more conversational
+                # We can't analyze without cloning, so give a helpful message
+                ai["response"] = (
+                    f"## 🚀 Deploying `{app_name}`\n\n"
+                    f"Starting deployment pipeline for:\n"
+                    f"`{repo_url}`\n\n"
+                    "**Pipeline:**\n"
+                    "1. 🔍 Pre-flight checks\n"
+                    "2. 📥 Clone repository\n"
+                    "3. 🧠 Analyze (Docker Compose / Dockerfile / framework)\n"
+                    "4. 🐳 Build & push image\n"
+                    "5. ☁️ Deploy to Cloud Run\n"
+                    "6. ✅ Health check\n\n"
+                    "*Watch the live deployment log below ↓*"
+                )
 
             elif intent == Intent.ROLLBACK:
                 t1 = time.monotonic()
@@ -167,7 +149,7 @@ class CoordinatorAgent:
                 steps.append(AgentStep(
                     agent=AgentType.MONITORING,
                     action="Fetch logs & metrics",
-                    result=f"{mon['log_count']} entries · {mon['error_rate']:.1f}% error rate [{mon.get('source','local')}]",
+                    result=f"{mon['log_count']} entries · {mon['error_rate']:.1f}% errors",
                     duration_ms=int((time.monotonic() - t1) * 1000),
                     status="warning" if mon["error_rate"] > 5 else "success",
                 ))
@@ -196,7 +178,7 @@ class CoordinatorAgent:
                 steps.append(AgentStep(
                     agent=AgentType.ROOT_CAUSE,
                     action="Root cause analysis",
-                    result=rca.get("root_cause", "Analysis complete"),
+                    result=rca.get("root_cause", "Complete"),
                     duration_ms=int((time.monotonic() - t1) * 1000),
                     status="success",
                 ))
@@ -209,13 +191,13 @@ class CoordinatorAgent:
                 steps.append(AgentStep(
                     agent=AgentType.FIX,
                     action="Apply remediation",
-                    result=fix.get("fix_applied", "Remediation applied"),
+                    result=fix.get("fix_applied", "Applied"),
                     duration_ms=int((time.monotonic() - t1) * 1000),
                     status="success",
                 ))
                 data["fix"] = fix
 
-            else:  # GENERAL
+            else:
                 t1 = time.monotonic()
                 try:
                     from services.gcp_monitor import get_real_system_health
@@ -248,3 +230,4 @@ class CoordinatorAgent:
             data=data if data else None,
             session_id=session_id,
         )
+

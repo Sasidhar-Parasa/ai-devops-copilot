@@ -1,6 +1,7 @@
 """
-Real Deployment Service.
-Uses async Cloud Build submit + polling to avoid log-streaming permission issues.
+Real Deployment Service with SSE streaming.
+Supports: docker-compose, Dockerfile, framework auto-detect.
+Streams real-time events to the frontend via async generators.
 """
 import asyncio
 import json
@@ -8,11 +9,10 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,26 @@ AR_REPO             = "copilot"
 BUILD_POLL_TIMEOUT  = 600
 BUILD_POLL_INTERVAL = 5
 
+
+# ── Event helpers ──────────────────────────────────────────────────────────────
+
+def _evt(stage: str, status: str, message: str,
+         data: Optional[Dict] = None) -> Dict:
+    return {
+        "stage":     stage,
+        "status":    status,   # running | success | error | info
+        "message":   message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "data":      data or {},
+    }
+
+
+def _sse(event: Dict) -> str:
+    """Format dict as SSE data line."""
+    return f"data: {json.dumps(event)}\n\n"
+
+
+# ── GCP helpers ────────────────────────────────────────────────────────────────
 
 def _is_cloud_run() -> bool:
     return bool(os.getenv("K_SERVICE") or os.getenv("GOOGLE_CLOUD_PROJECT"))
@@ -48,160 +68,253 @@ def gcloud_available() -> bool:
 def _clean(text: str) -> str:
     skip = ("log file", "CLOUDSDK_CONFIG", "configuration directory",
             "Permission denied", "creating a configuration")
-    lines = [ln for ln in text.splitlines()
-             if not any(s.lower() in ln.lower() for s in skip) and ln.strip()]
-    return "\n".join(lines)
+    return "\n".join(
+        ln for ln in text.splitlines()
+        if not any(s.lower() in ln.lower() for s in skip) and ln.strip()
+    )
 
 
 def check_gcp_config() -> Tuple[bool, str]:
     if not GCP_PROJECT_ID:
         return False, (
-            "**GCP_PROJECT_ID** is not set.\n\n"
-            "Add it to your Cloud Run service environment variables and redeploy."
+            "**GCP_PROJECT_ID** not set.\n"
+            "Add it to your Cloud Run service environment variables."
         )
     if not gcloud_available():
-        return False, (
-            "**gcloud CLI not found** in the container.\n\n"
-            "Rebuild the backend after updating the Dockerfile."
-        )
+        return False, "**gcloud CLI not found** in the container. Rebuild the backend."
+
     rc, out = _run_sync(
         ["gcloud", "projects", "describe", GCP_PROJECT_ID,
          "--format=value(projectId)", "--quiet"]
     )
     if rc != 0:
         return False, (
-            f"Cannot access GCP project `{GCP_PROJECT_ID}`.\n\n"
+            f"Cannot access GCP project `{GCP_PROJECT_ID}`.\n"
             "Run `grant_cloudrun_roles.sh` to fix SA permissions.\n\n"
             f"```\n{_clean(out)[:400]}\n```"
         )
-    logger.info("GCP OK (project=%s cloud_run=%s)", GCP_PROJECT_ID, _is_cloud_run())
     return True, ""
 
 
-class ValidationResult:
-    def __init__(self):
-        self.valid     = True
-        self.errors:   List[str] = []
-        self.warnings: List[str] = []
-        self.checks:   List[str] = []
+# ── Main streaming pipeline ────────────────────────────────────────────────────
 
-    def fail(self, m: str):
-        self.valid = False
-        self.errors.append(m)
+async def stream_deploy_pipeline(
+    repo_url: str,
+    app_name: str,
+    version: str = "latest",
+) -> AsyncIterator[str]:
+    """
+    Async generator — yields SSE strings as deployment progresses.
+    Caller does:  async for chunk in stream_deploy_pipeline(...): yield chunk
+    """
+    pid      = f"dep-{uuid.uuid4().hex[:8]}"
+    stages:  List[Dict] = []
+    start    = datetime.utcnow()
+    svc_name = _safe_name(app_name)
 
-    def warn(self, m: str):
-        self.warnings.append(m)
+    def completed_stage(name: str, status: str, logs: str, dur: float):
+        stages.append({
+            "name": name, "status": status, "logs": logs,
+            "duration_seconds": round(dur),
+            "timestamp": datetime.utcnow().isoformat(),
+        })
 
-    def ok(self, m: str):
-        self.checks.append(m)
+    async def emit(stage: str, status: str, msg: str, data: Dict = {}) -> str:
+        return _sse(_evt(stage, status, msg, data))
 
+    # ── Pre-flight ─────────────────────────────────────────────────────────────
+    yield await emit("preflight", "running", "Checking GCP credentials…")
+    ok, err = check_gcp_config()
+    if not ok:
+        yield await emit("preflight", "error", err)
+        yield _sse({"stage": "done", "status": "failed",
+                    "pipeline_id": pid, "error": err, "stages": stages,
+                    "timestamp": datetime.utcnow().isoformat()})
+        return
+    yield await emit("preflight", "success", f"GCP project `{GCP_PROJECT_ID}` verified ✓")
 
-def validate_repo(path: Path) -> ValidationResult:
-    r = ValidationResult()
-    if not (path / "Dockerfile").exists():
-        r.fail(
-            "**Dockerfile not found** in repo root.\n\n"
-            "Quick Python example:\n"
-            "```dockerfile\n"
-            "FROM python:3.11-slim\n"
-            "WORKDIR /app\n"
-            "COPY . .\n"
-            "RUN pip install flask\n"
-            'CMD ["python", "app.py"]\n'
-            "```"
-        )
+    # ── Clone ──────────────────────────────────────────────────────────────────
+    yield await emit("clone", "running", f"Cloning `{repo_url}`…")
+    t = asyncio.get_event_loop().time()
+    repo_path, clone_err = await _clone(repo_url, svc_name)
+    dur = asyncio.get_event_loop().time() - t
+
+    if not repo_path:
+        yield await emit("clone", "error", clone_err)
+        completed_stage("Clone", "failed", clone_err, dur)
+        yield _sse({"stage": "done", "status": "failed", "pipeline_id": pid,
+                    "error": clone_err, "stages": stages,
+                    "timestamp": datetime.utcnow().isoformat()})
+        return
+
+    completed_stage("Clone", "success", f"Cloned `{repo_url}`", dur)
+    yield await emit("clone", "success", "Repository cloned ✓")
+
+    # ── Analyze ────────────────────────────────────────────────────────────────
+    yield await emit("analyze", "running", "Analyzing repository structure…")
+    from services.repo_analyzer import analyze_repo
+    plan = analyze_repo(repo_path)
+
+    if not plan.valid:
+        err_msg = "\n\n".join(plan.errors)
+        yield await emit("analyze", "error", err_msg)
+        shutil.rmtree(repo_path, ignore_errors=True)
+        completed_stage("Analyze", "failed", err_msg, 0)
+        yield _sse({"stage": "done", "status": "failed", "pipeline_id": pid,
+                    "error": err_msg, "stages": stages,
+                    "timestamp": datetime.utcnow().isoformat()})
+        return
+
+    # Emit analysis summary
+    for w in plan.warnings:
+        yield await emit("analyze", "info", w)
+    yield await emit("analyze", "success", plan.summary,
+                     {"strategy": plan.strategy,
+                      "framework": plan.framework,
+                      "services": [s.name for s in plan.services]})
+    completed_stage("Analyze", "success", plan.summary, 0)
+
+    # ── Build + Push ───────────────────────────────────────────────────────────
+    # Use the primary/first deployable service
+    primary = _pick_primary_service(plan)
+    image_uri = f"{AR_HOST}/{GCP_PROJECT_ID}/{AR_REPO}/{svc_name}:{version}"
+
+    yield await emit("build", "running",
+                     f"Submitting Cloud Build for `{svc_name}`…",
+                     {"image": image_uri})
+
+    t = asyncio.get_event_loop().time()
+    ok, build_id, build_log = await _cloud_build(repo_path, image_uri, primary)
+    dur = asyncio.get_event_loop().time() - t
+    shutil.rmtree(repo_path, ignore_errors=True)
+
+    if not ok:
+        yield await emit("build", "error", build_log)
+        completed_stage("Build", "failed", build_log, dur)
+        yield _sse({"stage": "done", "status": "failed", "pipeline_id": pid,
+                    "error": build_log, "stages": stages,
+                    "timestamp": datetime.utcnow().isoformat()})
+        return
+
+    build_url = (
+        f"https://console.cloud.google.com/cloud-build/builds"
+        f"/{build_id}?project={GCP_PROJECT_ID}"
+    ) if build_id else ""
+    yield await emit("build", "success",
+                     "Image built and pushed ✓",
+                     {"image": image_uri, "build_url": build_url})
+    completed_stage("Build", "success",
+                     f"Image: `{image_uri}`\n[Logs]({build_url})", dur)
+
+    # ── Deploy to Cloud Run ────────────────────────────────────────────────────
+    port = primary.port if primary else plan.primary_port
+    yield await emit("deploy", "running",
+                     f"Deploying `{svc_name}` to Cloud Run ({GCP_REGION})…",
+                     {"port": port})
+
+    t = asyncio.get_event_loop().time()
+    ok, svc_url, deploy_log = await _cloud_run_deploy(image_uri, svc_name, port)
+    dur = asyncio.get_event_loop().time() - t
+
+    if not ok:
+        yield await emit("deploy", "error", deploy_log)
+        completed_stage("Deploy", "failed", deploy_log, dur)
+        yield _sse({"stage": "done", "status": "failed", "pipeline_id": pid,
+                    "error": deploy_log, "stages": stages,
+                    "timestamp": datetime.utcnow().isoformat()})
+        return
+
+    completed_stage("Deploy", "success", f"Live at {svc_url}", dur)
+    yield await emit("deploy", "success",
+                     "Deployed to Cloud Run ✓",
+                     {"url": svc_url})
+
+    # ── Health check ───────────────────────────────────────────────────────────
+    yield await emit("health", "running", "Running health check…")
+    import httpx
+    healthy = False
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            for _ in range(5):
+                try:
+                    r = await client.get(svc_url)
+                    if r.status_code < 500:
+                        healthy = True
+                        break
+                except Exception:
+                    await asyncio.sleep(3)
+    except Exception:
+        pass
+
+    if healthy:
+        yield await emit("health", "success", "Health check passed ✓",
+                         {"url": svc_url})
     else:
-        r.ok("Dockerfile found")
-    for ep in ["main.py", "app.py", "server.py", "index.js"]:
-        if (path / ep).exists():
-            r.ok(f"Entry point: `{ep}`")
-            break
-    for dep in ["requirements.txt", "package.json", "pyproject.toml"]:
-        if (path / dep).exists():
-            r.ok(f"`{dep}` found")
-            break
-    return r
+        yield await emit("health", "info",
+                         "Service deployed but health check did not respond "
+                         "(may still be starting up)",
+                         {"url": svc_url})
 
+    # ── Done ───────────────────────────────────────────────────────────────────
+    total = round((datetime.utcnow() - start).total_seconds())
+    _save_dep(pid, app_name, version, "success", stages, repo_url, None, svc_url)
+
+    yield _sse({
+        "stage":       "done",
+        "status":      "success",
+        "pipeline_id": pid,
+        "service_url": svc_url,
+        "image_uri":   image_uri,
+        "stages":      stages,
+        "total_seconds": total,
+        "timestamp":   datetime.utcnow().isoformat(),
+    })
+
+
+# ── Non-streaming wrapper (used by chat coordinator) ──────────────────────────
 
 async def full_deploy_pipeline(
     repo_url: str,
     app_name: str,
     version: str = "latest",
 ) -> Dict[str, Any]:
-    pid       = f"dep-{uuid.uuid4().hex[:8]}"
-    stages:   List[Dict] = []
-    start     = datetime.utcnow()
-    svc_name  = _safe_name(app_name)
-    image_uri = f"{AR_HOST}/{GCP_PROJECT_ID}/{AR_REPO}/{svc_name}:{version}"
+    """
+    Collects all SSE events and returns final result dict.
+    Used by the chat coordinator which doesn't need streaming.
+    """
+    stages: List[Dict] = []
+    final: Dict[str, Any] = {}
 
-    def add(name: str, status: str, logs: str, dur: float):
-        stages.append({
-            "name": name, "status": status,
-            "logs": logs, "duration_seconds": round(dur),
-            "timestamp": datetime.utcnow().isoformat(),
-        })
+    async for chunk in stream_deploy_pipeline(repo_url, app_name, version):
+        if not chunk.startswith("data: "):
+            continue
+        try:
+            evt = json.loads(chunk[6:])
+        except json.JSONDecodeError:
+            continue
 
-    def fail(name: str, err: str, dur: float = 0) -> Dict:
-        add(name, "failed", err, dur)
-        _save(pid, app_name, version, "failed", stages, repo_url, err)
-        return {
-            "pipeline_id": pid, "app_name": app_name,
-            "version": version, "repo_url": repo_url,
-            "status": "failed", "stages": stages,
-            "error": err, "service_url": None,
-            "created_at": start.isoformat(),
-        }
+        if evt.get("stage") == "done":
+            final = evt
+        elif evt.get("status") in ("success", "failed", "error"):
+            stages.append(evt)
 
-    ok, err = check_gcp_config()
-    if not ok:
-        return fail("Pre-flight", err)
-
-    t = asyncio.get_event_loop().time()
-    repo_path, log = await _clone(repo_url, svc_name)
-    dur = asyncio.get_event_loop().time() - t
-    if not repo_path:
-        return fail("Clone", log, dur)
-    add("Clone", "success", log, dur)
-
-    t = asyncio.get_event_loop().time()
-    v = validate_repo(repo_path)
-    dur = asyncio.get_event_loop().time() - t
-    vlog = "\n".join(v.checks + v.warnings + v.errors)
-    if not v.valid:
-        shutil.rmtree(repo_path, ignore_errors=True)
-        return fail("Validate", vlog, dur)
-    add("Validate", "success", vlog, dur)
-
-    t = asyncio.get_event_loop().time()
-    ok, build_id, blog = await _cloud_build(repo_path, image_uri)
-    dur = asyncio.get_event_loop().time() - t
-    shutil.rmtree(repo_path, ignore_errors=True)
-    if not ok:
-        return fail("Build", blog, dur)
-    build_url = (
-        f"https://console.cloud.google.com/cloud-build/builds/"
-        f"{build_id}?project={GCP_PROJECT_ID}"
-    ) if build_id else ""
-    add("Build", "success",
-        f"Image: `{image_uri}`\n[View logs]({build_url})", dur)
-
-    t = asyncio.get_event_loop().time()
-    ok, svc_url, dlog = await _cloud_run_deploy(image_uri, svc_name)
-    dur = asyncio.get_event_loop().time() - t
-    if not ok:
-        return fail("Deploy", dlog, dur)
-    add("Deploy", "success", dlog, dur)
-
-    total = round((datetime.utcnow() - start).total_seconds())
-    result = {
-        "pipeline_id": pid, "app_name": app_name, "version": version,
-        "repo_url": repo_url, "status": "success", "stages": stages,
-        "error": None, "image_uri": image_uri, "service_url": svc_url,
-        "created_at": start.isoformat(), "total_duration_seconds": total,
+    status = "success" if final.get("status") == "success" else "failed"
+    return {
+        "pipeline_id":  final.get("pipeline_id", ""),
+        "app_name":     app_name,
+        "version":      version,
+        "repo_url":     repo_url,
+        "status":       status,
+        "stages":       stages,
+        "error":        final.get("error") if status == "failed" else None,
+        "service_url":  final.get("service_url"),
+        "image_uri":    final.get("image_uri"),
+        "created_at":   datetime.utcnow().isoformat(),
+        "total_duration_seconds": final.get("total_seconds", 0),
     }
-    _save(pid, app_name, version, "success", stages, repo_url, None, svc_url)
-    return result
 
+
+# ── Stage implementations ──────────────────────────────────────────────────────
 
 async def _clone(repo_url: str, name: str) -> Tuple[Optional[Path], str]:
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -209,8 +322,7 @@ async def _clone(repo_url: str, name: str) -> Tuple[Optional[Path], str]:
     if dest.exists():
         shutil.rmtree(dest)
     rc, out = await _run(
-        ["git", "clone", "--depth", "1", repo_url, str(dest)],
-        timeout=120,
+        ["git", "clone", "--depth", "1", repo_url, str(dest)], timeout=120
     )
     if rc != 0:
         return None, (
@@ -221,25 +333,52 @@ async def _clone(repo_url: str, name: str) -> Tuple[Optional[Path], str]:
     return dest, f"Cloned `{repo_url}`"
 
 
-async def _cloud_build(repo_path: Path, image_uri: str) -> Tuple[bool, str, str]:
-    logger.info("Submitting Cloud Build: %s", image_uri)
-    rc, out = await _run(
+def _pick_primary_service(plan):
+    if not plan.services:
+        return None
+    priority = ["web", "backend", "app", "api", "frontend", "server"]
+    for key in priority:
+        for svc in plan.services:
+            if key in svc.name.lower():
+                return svc
+    return plan.services[0]
+
+
+async def _cloud_build(
+    repo_path: Path,
+    image_uri: str,
+    primary_svc,
+) -> Tuple[bool, str, str]:
+    # Build the correct context (compose service may have a subdir)
+    build_cwd = repo_path
+    df_flag: List[str] = []
+
+    if primary_svc and primary_svc.build_context:
+        ctx = repo_path / primary_svc.build_context
+        if ctx.exists():
+            build_cwd = ctx
+    if primary_svc and primary_svc.dockerfile:
+        df_path = Path(primary_svc.dockerfile)
+        if df_path.is_absolute():
+            rel = df_path.relative_to(build_cwd) if df_path.is_relative_to(build_cwd) else df_path
+            df_flag = ["--file", str(rel)]
+
+    cmd = (
         ["gcloud", "builds", "submit",
          "--tag", image_uri,
          "--timeout", "600",
-         "--async",
-         "--quiet", "."],
-        cwd=repo_path,
-        timeout=120,
+         "--async", "--quiet"]
+        + df_flag
+        + ["."]
     )
+
+    logger.info("Cloud Build cmd: %s (cwd=%s)", cmd, build_cwd)
+    rc, out = await _run(cmd, cwd=build_cwd, timeout=120)
     build_id = _extract_build_id(out)
-    logger.info("Build submitted id=%s rc=%d", build_id, rc)
+    logger.info("Build submitted: id=%s rc=%d", build_id, rc)
 
     if not build_id:
-        return False, "", (
-            "Failed to submit build.\n\n"
-            f"```\n{_clean(out)[:1500]}\n```"
-        )
+        return False, "", f"Failed to submit build.\n```\n{_clean(out)[:1500]}\n```"
 
     ok, poll_log = await _poll_build(build_id)
     return ok, build_id, poll_log
@@ -247,77 +386,71 @@ async def _cloud_build(repo_path: Path, image_uri: str) -> Tuple[bool, str, str]
 
 async def _poll_build(build_id: str) -> Tuple[bool, str]:
     deadline = asyncio.get_event_loop().time() + BUILD_POLL_TIMEOUT
-    last_status = "UNKNOWN"
-
+    last = "UNKNOWN"
     while asyncio.get_event_loop().time() < deadline:
         rc, out = await _run(
             ["gcloud", "builds", "describe", build_id,
-             "--format=value(status)", "--quiet"],
+             "--format=value(status)", "--quiet"]
         )
         if rc == 0:
-            last_status = out.strip()
-            logger.info("Build %s: %s", build_id, last_status)
-            if last_status == "SUCCESS":
-                return True, f"Cloud Build succeeded (id: `{build_id}`)"
-            if last_status in ("FAILURE", "INTERNAL_ERROR", "TIMEOUT", "CANCELLED"):
+            last = out.strip()
+            logger.info("Build %s: %s", build_id, last)
+            if last == "SUCCESS":
+                return True, f"Build succeeded (id: `{build_id}`)"
+            if last in ("FAILURE", "INTERNAL_ERROR", "TIMEOUT", "CANCELLED"):
                 _, log_out = await _run(
-                    ["gcloud", "builds", "log", build_id, "--quiet"],
-                    timeout=30,
+                    ["gcloud", "builds", "log", build_id, "--quiet"], timeout=30
                 )
                 tail = log_out[-1500:] if log_out else "(no logs)"
                 return False, (
-                    f"Cloud Build **{last_status}** (id: `{build_id}`)\n\n"
+                    f"Cloud Build **{last}** (id: `{build_id}`)\n\n"
                     f"```\n{tail}\n```\n\n"
-                    f"[Full logs](https://console.cloud.google.com/cloud-build/builds/"
-                    f"{build_id}?project={GCP_PROJECT_ID})"
+                    f"[Full logs](https://console.cloud.google.com/cloud-build"
+                    f"/builds/{build_id}?project={GCP_PROJECT_ID})"
                 )
         await asyncio.sleep(BUILD_POLL_INTERVAL)
-
-    return False, (
-        f"Build timed out after {BUILD_POLL_TIMEOUT}s (status: {last_status}).\n"
-        f"Check: https://console.cloud.google.com/cloud-build/builds/{build_id}"
-    )
+    return False, f"Build timed out after {BUILD_POLL_TIMEOUT}s (status: {last})"
 
 
 def _extract_build_id(output: str) -> Optional[str]:
     m = re.search(
-        r"builds/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+        r"builds/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+        r"-[0-9a-f]{4}-[0-9a-f]{12})",
         output,
     )
     return m.group(1) if m else None
 
 
-async def _cloud_run_deploy(image_uri: str, svc: str) -> Tuple[bool, str, str]:
-    logger.info("Deploying to Cloud Run: %s", svc)
+async def _cloud_run_deploy(
+    image_uri: str, svc: str, port: int = 8080
+) -> Tuple[bool, str, str]:
     rc, out = await _run(
-        [
-            "gcloud", "run", "deploy", svc,
-            "--image", image_uri,
-            "--platform", "managed",
-            "--region", GCP_REGION,
-            "--allow-unauthenticated",
-            "--memory", "512Mi",
-            "--cpu", "1",
-            "--min-instances", "0",
-            "--max-instances", "5",
-            "--port", "8080",
-            "--quiet",
-        ],
+        ["gcloud", "run", "deploy", svc,
+         "--image", image_uri,
+         "--platform", "managed",
+         "--region", GCP_REGION,
+         "--allow-unauthenticated",
+         "--memory", "512Mi", "--cpu", "1",
+         "--min-instances", "0", "--max-instances", "5",
+         "--port", str(port), "--quiet"],
         timeout=300,
     )
     if rc != 0:
         return False, "", f"Cloud Run deploy failed.\n```\n{_clean(out)[-1500:]}\n```"
     rc2, url = await _run(
         ["gcloud", "run", "services", "describe", svc,
-         "--region", GCP_REGION, "--format=value(status.url)"],
+         "--region", GCP_REGION, "--format=value(status.url)"]
     )
-    return True, url.strip(), f"Deployed `{svc}` to Cloud Run"
+    return True, url.strip(), f"Deployed `{svc}`"
 
+
+# ── Subprocess utils ────────────────────────────────────────────────────────────
 
 def _run_sync(cmd: List[str]) -> Tuple[int, str]:
+    import subprocess
     try:
         r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30, env=_gcloud_env(),
+            cmd, capture_output=True, text=True, timeout=30, env=_gcloud_env()
         )
         return r.returncode, r.stdout + r.stderr
     except Exception as exc:  # noqa: BLE001
@@ -348,15 +481,12 @@ async def _run(
         return 1, str(exc)
 
 
-def _save(
-    pid: str,
-    app: str,
-    ver: str,
-    status: str,
-    stages: list,
-    repo_url: str,
-    err: Optional[str],
-    url: Optional[str] = None,
+# ── DB ──────────────────────────────────────────────────────────────────────────
+
+def _save_dep(
+    pid: str, app: str, ver: str, status: str,
+    stages: list, repo_url: str,
+    err: Optional[str], url: Optional[str] = None,
 ) -> None:
     try:
         from services.database import save_deployment
@@ -378,3 +508,4 @@ def _save(
 def _safe_name(name: str) -> str:
     name = re.sub(r"[^a-z0-9-]", "-", name.lower())
     return re.sub(r"-+", "-", name).strip("-")[:49] or "app"
+
