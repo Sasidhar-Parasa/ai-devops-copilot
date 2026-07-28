@@ -339,23 +339,6 @@ OLLAMA_MODEL=llama3
 
 ---
 
-## 🎯 Hackathon Demo Script
-
-1. Open the app at your public URL
-2. **Chat tab** — type: `deploy myapp v2.5.0`
-   - Watch the multi-agent trace unfold
-   - See Build → Test → Deploy pipeline
-3. **Dashboard tab** — show live service health
-   - Point out degraded payment-service (pre-seeded)
-   - Show active incident card
-4. Back to **Chat** — type: `why did the deployment fail?`
-   - RCA agent fires with evidence & confidence score
-5. Type: `auto fix the payment service`
-   - Fix agent applies remediation, marks incident resolved
-6. **Refresh dashboard** — incident is now resolved ✅
-
----
-
 ## 📊 API Reference
 
 | Endpoint | Method | Description |
@@ -384,4 +367,3 @@ OLLAMA_MODEL=llama3
 | Icons | Lucide React |
 | Deployment | Docker, GCP Cloud Run, Artifact Registry |
 | CI/CD | Cloud Build |
-# CI/CD enabled Thu Apr 23 17:24:27 UTC 2026
